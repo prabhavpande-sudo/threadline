@@ -18,6 +18,7 @@ import { relateEntities } from "./resolve.js";
 import { indexMeeting } from "./chunker.js";
 import { reindexMeeting } from "./extract.js";
 import { meetingVocabulary } from "./vocabulary.js";
+import { localTranscribeOnly } from "../lib/local-asr.js";
 import { groundedIn, type StepRecord } from "../lib/harness.js";
 import { recordRun } from "../lib/runlog.js";
 import { because, publicReason, reasonFrom } from "../lib/reasons.js";
@@ -139,6 +140,9 @@ async function diarizeInner(db: DatabaseSync, apiKey: string, meetingId: string,
     steps.push({ name: "diarize:guard", status: "skipped", attempts: 0, ms: 0, reason: because("info", reason) });
     setRun(db, meetingId, { status: "skipped", reason });
   };
+
+  // The diarized job uploads the tape; on-device mode promised it wouldn't.
+  if (localTranscribeOnly()) return skip("on-device transcription mode — speaker split needs the speech API");
 
   // Resumed meetings write suffixed tapes with unpersisted offset bases — v1 skips.
   const dir = "data/recordings";
