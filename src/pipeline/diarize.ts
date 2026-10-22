@@ -19,6 +19,7 @@ import { indexMeeting } from "./chunker.js";
 import { reindexMeeting } from "./extract.js";
 import { meetingVocabulary } from "./vocabulary.js";
 import { localTranscribeOnly } from "../lib/local-asr.js";
+import { nameSpeakersFromHints } from "./speaker-names.js";
 import { groundedIn, type StepRecord } from "../lib/harness.js";
 import { recordRun } from "../lib/runlog.js";
 import { because, publicReason, reasonFrom } from "../lib/reasons.js";
@@ -227,6 +228,10 @@ async function diarizeInner(db: DatabaseSync, apiKey: string, meetingId: string,
     }
 
     if (anyRewrite) {
+      // Fresh "Speaker N" labels take the names the meeting app showed, where
+      // the evidence is strong enough — before anything is derived from them.
+      const named = nameSpeakersFromHints(db, meetingId);
+      if (named.length) notes.push(`${named.length} speaker${named.length === 1 ? "" : "s"} named from the meeting app`);
       rederiveMeeting(db, meetingId);
       // The outline's [S###] receipts are positional — substitution renumbered
       // every line, so the old notes now cite the WRONG segments. Facts are

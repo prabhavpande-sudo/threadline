@@ -220,6 +220,16 @@ export function openDb(dir = "data"): DatabaseSync {
       updated_at INTEGER NOT NULL
     );
 
+    -- Who the meeting app showed as speaking, sampled during the take
+    -- (capture/threadline-speakers). Diarization votes these onto Speaker N.
+    CREATE TABLE IF NOT EXISTS speaker_hints (
+      meeting_id TEXT NOT NULL REFERENCES meetings(id),
+      offset_s REAL NOT NULL,          -- same clock as utterances.offset_s
+      name TEXT NOT NULL,
+      app TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_speaker_hints ON speaker_hints(meeting_id, offset_s);
+
     CREATE INDEX IF NOT EXISTS idx_alias_norm       ON entity_aliases(norm);
     CREATE INDEX IF NOT EXISTS idx_mentions_entity  ON entity_mentions(entity_id, meeting_id);
     CREATE INDEX IF NOT EXISTS idx_mentions_meeting ON entity_mentions(meeting_id, gate);

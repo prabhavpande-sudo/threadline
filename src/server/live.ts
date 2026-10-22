@@ -29,6 +29,9 @@ const ROLE: Record<string, "agent" | "customer"> = { You: "agent", Them: "custom
 
 export class LiveSession {
   private helper: ChildProcess | null = null;
+  /** Reads the meeting app's "who's speaking" cue; its samples name diarized voices. */
+  private speakerWatch: ChildProcess | null = null;
+  private speakerHints: { offset_s: number; name: string; app: string }[] = [];
   private sockets: (WebSocket | null)[] = [null, null];
   /** Audio always lands on disk too, so a PyAI outage never loses a meeting. */
   private tapes: (WriteStream | null)[] = [null, null];
@@ -103,6 +106,7 @@ export class LiveSession {
     this.helper.on("exit", (code) => {
       if (!this.stopping) this.emit({ type: "error", message: `capture helper exited (${code})` });
     });
+    this.watchSpeakers();
 
     // Parse the framed stream and route audio to the right socket.
     let buf = Buffer.alloc(0);
@@ -118,6 +122,31 @@ export class LiveSession {
         this.audioBytes[channel] += pcm.length;
         const ws = this.sockets[channel];
         if (ws?.readyState === WebSocket.OPEN) ws.send(pcm);
+      }
+    });
+  }
+
+  /**
+   * Best-effort: sample who the meeting app shows as speaking. Missing helper,
+   * no Accessibility permission or no meeting app all just mean no hints.
+   * Skipped in on-device mode, where diarization (the only consumer) is off.
+   */
+  private watchSpeakers() {
+    const bin = "capture/threadline-speakers";
+    if (!existsSync(bin) || localTranscribeOnly() || process.env.THREADLINE_SPEAKER_NAMES === "0") return;
+    this.speakerWatch = spawn(bin, [], { stdio: ["pipe", "pipe", "pipe"] });
+    this.speakerWatch.on("error", () => { this.speakerWatch = null; });
+    this.speakerWatch.stderr!.on("data", (d: Buffer) => this.emit({ type: "status", message: d.toString().trim() }));
+    let pending = "";
+    this.speakerWatch.stdout!.on("data", (d: Buffer) => {
+      const lines = (pending + d.toString()).split("\n");
+      pending = lines.pop() ?? "";
+      for (const line of lines) {
+        try {
+          const h = JSON.parse(line) as { t_ms: number; name: string; app: string };
+          if (typeof h.t_ms !== "number" || !h.name) continue;
+          this.speakerHints.push({ offset_s: this.offsetBase + (h.t_ms - this.startedAt) / 1000, name: h.name.slice(0, 60), app: h.app });
+        } catch { /* partial or foreign line */ }
       }
     });
   }
@@ -247,6 +276,8 @@ export class LiveSession {
     await new Promise((r) => setTimeout(r, 1500));
     for (const ws of this.sockets) ws?.close(1000);
     this.helper?.kill("SIGTERM");
+    this.speakerWatch?.stdin?.end();
+    this.speakerWatch?.kill("SIGTERM");
 
     for (const t of this.tapes) t?.end();
 
@@ -329,6 +360,12 @@ export class LiveSession {
         this.db.prepare("UPDATE meetings SET exit = 'failed' WHERE id = ?").run(this.meetingId);
       }
       return { meetingId: this.meetingId, exit: "discarded", reason };
+    }
+
+    // The meeting is being kept: store who the app showed speaking, for diarization.
+    if (this.speakerHints.length) {
+      const ins = this.db.prepare("INSERT INTO speaker_hints (meeting_id, offset_s, name, app) VALUES (?, ?, ?, ?)");
+      for (const h of this.speakerHints) ins.run(this.meetingId, h.offset_s, h.name, h.app);
     }
 
     // Resuming an earlier meeting: this session's finals extend what's stored.
