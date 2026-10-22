@@ -17,6 +17,10 @@
 //   THREADLINE_MIC_APPS=a,b     bundle-ID prefixes that count as meeting apps
 //   THREADLINE_CAL_PROMPT=0     turn the calendar offer off
 //   THREADLINE_CAL_LEAD_SEC=60  how early the calendar offer appears
+// During a take, if the meeting app that held the mic lets go of it for 10s,
+// the panel counts down 15s ("Stopping in 12s", with Keep) and
+// then stops. Takes with no meeting app on the mic never auto-stop.
+//   THREADLINE_AUTO_STOP=0      turn auto-stop off
 // Needs no permissions.
 //
 // Build:  swiftc -O capture/ThreadlinePanel.swift -o capture/threadline-panel
@@ -67,9 +71,13 @@ final class PanelController: NSObject {
     private let titleLabel = NSTextField(labelWithString: "Recording")
     private let timeLabel = NSTextField(labelWithString: "00:00")
     private let dot = NSView(frame: NSRect(x: 14, y: 25, width: 10, height: 10))
+    private let keepButton = NSButton(title: "Keep", target: nil, action: nil)
     private var startedAtMs: Double = 0
     private var stopping = false
     private var ticker: Timer?
+    private var title = "Recording"
+    /// Called when Keep is pressed during an auto-stop countdown.
+    var onKeep: (() -> Void)?
 
     override init() {
         let size = NSSize(width: 292, height: 60)
@@ -118,6 +126,15 @@ final class PanelController: NSObject {
         timeLabel.textColor = .secondaryLabelColor
         blur.addSubview(timeLabel)
 
+        // Shares the timer's slot; only visible during an auto-stop countdown.
+        keepButton.target = self
+        keepButton.action = #selector(keepTapped)
+        keepButton.frame = NSRect(x: 172, y: 15, width: 60, height: 30)
+        keepButton.bezelStyle = .rounded
+        keepButton.toolTip = "Keep recording"
+        keepButton.isHidden = true
+        blur.addSubview(keepButton)
+
         let stop = NSButton(title: "■", target: self, action: #selector(stopTapped))
         stop.frame = NSRect(x: 234, y: 15, width: 44, height: 30)
         stop.bezelStyle = .rounded
@@ -136,7 +153,8 @@ final class PanelController: NSObject {
     func apply(recording: Bool, title: String?, startedAt: Double?) {
         if recording && !stopping {
             startedAtMs = startedAt ?? startedAtMs
-            titleLabel.stringValue = (title?.isEmpty == false ? title! : "Recording")
+            self.title = (title?.isEmpty == false ? title! : "Recording")
+            if keepButton.isHidden { titleLabel.stringValue = self.title }
             if !panel.isVisible {
                 if startedAt == nil { startedAtMs = Date().timeIntervalSince1970 * 1000 }
                 tickTime()
@@ -151,6 +169,7 @@ final class PanelController: NSObject {
     }
 
     private func hide() {
+        showCountdown(nil)
         guard panel.isVisible else { return }
         panel.orderOut(nil)
         ticker?.invalidate()
@@ -163,11 +182,35 @@ final class PanelController: NSObject {
         timeLabel.stringValue = String(format: "%02d:%02d", secs / 60, secs % 60)
     }
 
-    @objc private func stopTapped() {
+    /// Auto-stop countdown text in place of the title, with Keep in place of
+    /// the timer; nil restores the normal panel.
+    func showCountdown(_ text: String?, reason: String = "") {
+        if let text = text {
+            if keepButton.isHidden { status("auto-stop countdown: \(reason)") }
+            titleLabel.stringValue = text
+            titleLabel.toolTip = reason
+            timeLabel.isHidden = true
+            keepButton.isHidden = false
+        } else if !keepButton.isHidden {
+            titleLabel.stringValue = title
+            timeLabel.isHidden = false
+            keepButton.isHidden = true
+        }
+    }
+
+    @objc private func keepTapped() {
+        status("auto-stop cancelled — keeping the recording")
+        showCountdown(nil)
+        onKeep?()
+    }
+
+    @objc private func stopTapped() { stop(notice: "■ Stopped — stitching the meeting…") }
+
+    func stop(notice: String) {
         guard !stopping else { return }
         stopping = true
         hide()
-        notify("■ Stopped — stitching the meeting…")
+        notify(notice)
         var req = URLRequest(url: STOP_URL)
         req.httpMethod = "POST"
         req.timeoutInterval = 300 // stop blocks through transcription + notes
@@ -345,6 +388,46 @@ final class CalendarOffer {
     }
 }
 
+/// Ends a take once the meeting app that held the mic during it lets go:
+/// 10s of grace, then a 15s countdown in the panel with Keep. Takes where no
+/// meeting app ever held the mic (an in-person room) never auto-stop.
+final class AutoStop {
+    enum Step { case idle, countdown(app: String, seconds: Int), stop(String) }
+    private var app: String?        // meeting app seen on the mic this take
+    private var absentSince: Double?
+    private var kept = false
+    private let graceMs = 10_000.0
+    private let countdownMs = 15_000.0
+
+    func step(recording: Bool, micApp: String?, now: Double) -> Step {
+        guard recording else {
+            app = nil
+            absentSince = nil
+            kept = false
+            return .idle
+        }
+        if let m = micApp {
+            app = m
+            absentSince = nil
+            return .idle
+        }
+        guard let left = app, !kept else { return .idle }
+        let since = absentSince ?? now
+        absentSince = since
+        let remaining = graceMs + countdownMs - (now - since)
+        if remaining > countdownMs { return .idle }
+        if remaining <= 0 {
+            app = nil
+            absentSince = nil
+            return .stop(left)
+        }
+        return .countdown(app: left, seconds: Int((remaining / 1000).rounded(.up)))
+    }
+
+    /// Keep pressed: no auto-stop for the rest of this take.
+    func keep() { kept = true }
+}
+
 /// The corner panel that shows the current offer, if any.
 final class OfferPanel: NSObject {
     private let panel: FloatingPanel
@@ -447,9 +530,12 @@ app.setActivationPolicy(.accessory) // no Dock icon, no menu bar
 let controller = PanelController()
 let micPromptEnabled = ProcessInfo.processInfo.environment["THREADLINE_MIC_PROMPT"] != "0"
 let calPromptEnabled = ProcessInfo.processInfo.environment["THREADLINE_CAL_PROMPT"] != "0"
+let autoStopEnabled = ProcessInfo.processInfo.environment["THREADLINE_AUTO_STOP"] != "0"
 let micOffer = MicOffer()
 let calendarOffer = CalendarOffer()
 let offerPanel = OfferPanel()
+let autoStop = AutoStop()
+controller.onKeep = { autoStop.keep() }
 
 // Upcoming events change slowly; the server caches calendar fetches anyway.
 func refreshUpcoming() {
@@ -480,9 +566,19 @@ Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
             startedAt = obj["startedAt"] as? Double
         }
         let serverUp = data != nil
-        let micApp = micPromptEnabled && serverUp && !recording ? meetingAppOnMic() : nil
+        // Idle: who might want recording. Recording: whether the call is still on.
+        let wantMic = serverUp && (recording ? autoStopEnabled : micPromptEnabled)
+        let micApp = wantMic ? meetingAppOnMic() : nil
         DispatchQueue.main.async {
             controller.apply(recording: recording, title: title, startedAt: startedAt)
+            switch autoStop.step(recording: recording, micApp: micApp, now: Date().timeIntervalSince1970 * 1000) {
+            case .idle: controller.showCountdown(nil)
+            case .countdown(let app, let seconds):
+                controller.showCountdown("Stopping in \(seconds)s", reason: "\(app) left the mic")
+            case .stop(let app):
+                status("\(app) left the mic — auto-stopping")
+                controller.stop(notice: "■ \(app) left the call — stitching the meeting…")
+            }
             // Both state machines advance every poll; calendar wins the corner.
             let now = Date().timeIntervalSince1970 * 1000
             let cal = calendarOffer.offer(recording: recording, now: now)
