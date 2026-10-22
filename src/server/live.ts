@@ -267,7 +267,7 @@ export class LiveSession {
       if (totalAudio < 32_000) {
         // under ~1s of audio across both channels: capture never really ran
         reason =
-          "No audio reached the app. Check Microphone and Screen Recording permissions (System Settings → Privacy & Security), then fully restart the app you run Threadline from.";
+          "No audio reached the app. Check Microphone plus System Audio Recording (or Screen Recording) permissions (System Settings → Privacy & Security), then fully restart the app you run Threadline from.";
       } else if (this.lastStreamError) {
         reason = `Audio was captured (${Math.round(totalAudio / 32_000)}s) but transcription failed: ${this.lastStreamError}. The recording is saved and can be processed once the service is reachable.`;
       } else {
