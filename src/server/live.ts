@@ -119,7 +119,9 @@ export class LiveSession {
 
   private openSocket(channel: number) {
     const speaker = SPEAKER[channel];
-    const ws = new WebSocket(streamUrl({ endpointingMs: 700 }), [`pyai-key.${this.apiKey}`]);
+    // PyAI echoes only the `pyai.v1` marker; offering the key alone gets no
+    // subprotocol back, which `ws` treats as a failed handshake.
+    const ws = new WebSocket(streamUrl({ endpointingMs: 700 }), ["pyai.v1", `pyai-key.${this.apiKey}`]);
     this.sockets[channel] = ws;
     ws.on("open", () => this.emit({ type: "status", message: `${speaker} stream connected` }));
     ws.on("message", (raw) => {
