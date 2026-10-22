@@ -84,10 +84,14 @@ let live: LiveSession | null = null;
 // while a take is live (any start path) with a timer and Stop. Best-effort
 // companion process; its absence must never affect the server.
 import { spawn as spawnProc } from "node:child_process";
+// While the panel runs it owns meeting-start prompts, so the web UI stays quiet.
+let panelAlive = false;
 if (existsSync("capture/threadline-panel")) {
   const panel = spawnProc("capture/threadline-panel", [], { stdio: ["pipe", "ignore", "pipe"] });
+  panelAlive = true;
   panel.stderr?.on("data", (d: Buffer) => console.log(d.toString().trim()));
-  panel.on("error", () => console.log("[panel] failed to start"));
+  panel.on("error", () => { panelAlive = false; console.log("[panel] failed to start"); });
+  panel.on("exit", () => { panelAlive = false; });
 }
 const sseClients = new Set<(e: LiveEvent) => void>();
 const recentEvents: LiveEvent[] = [];
@@ -196,6 +200,18 @@ const MEETING_LIST_SQL = `
     (SELECT GROUP_CONCAT(DISTINCT speaker) FROM utterances u WHERE u.meeting_id = m.id AND speaker IS NOT NULL) AS participants,
     (SELECT GROUP_CONCAT(mp.project_id) FROM meeting_projects mp WHERE mp.meeting_id = m.id) AS topic_ids
   FROM meetings m ORDER BY m.started_at DESC`;
+
+// The web UI and the floating panel both poll /api/upcoming, so calendar
+// fetches are reused for a minute. Keyed on the source, so connecting a
+// different calendar never serves the old one's events.
+let calCache: { key: string; at: number; events: Awaited<ReturnType<typeof upcomingEvents>> } | null = null;
+async function calendarEvents() {
+  const key = googleConnected() ? "oauth" : `ics:${icsUrl(db)}`;
+  if (calCache && calCache.key === key && Date.now() - calCache.at < 60_000) return calCache.events;
+  const events = googleConnected() ? await upcomingEvents() : await icsUpcomingEvents(db);
+  calCache = { key, at: Date.now(), events };
+  return events;
+}
 
 const api: Record<string, Handler> = {
   "GET /api/today"() {
@@ -526,6 +542,7 @@ const api: Record<string, Handler> = {
     return {
       script: path.resolve("scripts/record-toggle.sh"),
       daemon: existsSync("capture/threadline-panel"),
+      native_meeting_prompts: panelAlive && process.env.THREADLINE_CAL_PROMPT !== "0",
     };
   },
 
@@ -975,7 +992,7 @@ const api: Record<string, Handler> = {
     ).all(Date.now() - 3600_000) as { title: string; at_ms: number }[];
     if (!googleConnected() && !icsUrl(db)) return manual;
     try {
-      const events = googleConnected() ? await upcomingEvents() : await icsUpcomingEvents(db);
+      const events = await calendarEvents();
       // merge, manual entries first on conflicts (same title + start)
       const seen = new Set(manual.map((m) => `${m.title}@${m.at_ms}`));
       const merged = [...manual, ...events.filter((e) => !seen.has(`${e.title}@${e.at_ms}`)).map((e, i) => ({ id: -1 - i, ...e, source: "google" }))];

@@ -7,6 +7,7 @@
  * OAuth "Web application" client with redirect http://localhost:4640/oauth2/callback).
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { findJoinUrl } from "./ics.js";
 
 const TOKEN_PATH = "data/google-token.json";
 const REDIRECT = "http://localhost:4640/oauth2/callback";
@@ -76,7 +77,7 @@ async function accessToken(): Promise<string> {
   return next.access_token;
 }
 
-export type CalEvent = { title: string; at_ms: number; end_ms: number; participants: string };
+export type CalEvent = { title: string; at_ms: number; end_ms: number; participants: string; join_url?: string };
 
 /** Next upcoming events from the primary calendar. */
 export async function upcomingEvents(maxResults = 6): Promise<CalEvent[]> {
@@ -92,17 +93,29 @@ export async function upcomingEvents(maxResults = 6): Promise<CalEvent[]> {
   });
   if (!res.ok) throw new Error(`calendar fetch failed: ${res.status}`);
   const d = (await res.json()) as {
-    items?: { summary?: string; start?: { dateTime?: string; date?: string }; end?: { dateTime?: string }; attendees?: { email: string; displayName?: string; self?: boolean }[] }[];
+    items?: {
+      summary?: string; start?: { dateTime?: string; date?: string }; end?: { dateTime?: string };
+      attendees?: { email: string; displayName?: string; self?: boolean }[];
+      hangoutLink?: string; location?: string; description?: string;
+      conferenceData?: { entryPoints?: { entryPointType?: string; uri?: string }[] };
+    }[];
   };
   return (d.items ?? [])
     .filter((e) => e.start?.dateTime) // skip all-day events
-    .map((e) => ({
-      title: e.summary ?? "(untitled)",
-      at_ms: new Date(e.start!.dateTime!).getTime(),
-      end_ms: e.end?.dateTime ? new Date(e.end.dateTime).getTime() : 0,
-      participants: (e.attendees ?? [])
-        .filter((a) => !a.self)
-        .map((a) => a.displayName ?? a.email.split("@")[0])
-        .join(", "),
-    }));
+    .map((e) => {
+      const join_url = findJoinUrl([
+        e.hangoutLink, e.conferenceData?.entryPoints?.find((p) => p.entryPointType === "video")?.uri,
+        e.location, e.description,
+      ]);
+      return {
+        title: e.summary ?? "(untitled)",
+        at_ms: new Date(e.start!.dateTime!).getTime(),
+        end_ms: e.end?.dateTime ? new Date(e.end.dateTime).getTime() : 0,
+        participants: (e.attendees ?? [])
+          .filter((a) => !a.self)
+          .map((a) => a.displayName ?? a.email.split("@")[0])
+          .join(", "),
+        ...(join_url && { join_url }),
+      };
+    });
 }

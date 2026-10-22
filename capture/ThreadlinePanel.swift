@@ -9,9 +9,14 @@
 // While idle it also watches which apps hold the microphone (CoreAudio's
 // process list, macOS 14.2+). When a meeting app keeps the mic for two polls,
 // it offers "● Record" in the same corner; × stays quiet until that app lets
-// go of the mic. It never starts a recording by itself.
-//   THREADLINE_MIC_PROMPT=0   turn the offer off
-//   THREADLINE_MIC_APPS=a,b   bundle-ID prefixes that count as meeting apps
+// go of the mic. A calendar event (GET /api/upcoming) gets the same corner
+// from a minute before it starts until five minutes after: "● Record & join"
+// starts the take and opens the event's call link. Calendar wins over mic.
+// Neither ever starts a recording by itself.
+//   THREADLINE_MIC_PROMPT=0     turn the mic offer off
+//   THREADLINE_MIC_APPS=a,b     bundle-ID prefixes that count as meeting apps
+//   THREADLINE_CAL_PROMPT=0     turn the calendar offer off
+//   THREADLINE_CAL_LEAD_SEC=60  how early the calendar offer appears
 // Needs no permissions.
 //
 // Build:  swiftc -O capture/ThreadlinePanel.swift -o capture/threadline-panel
@@ -23,6 +28,7 @@ import Foundation
 let STATE_URL = URL(string: "http://127.0.0.1:4640/api/record/state")!
 let STOP_URL = URL(string: "http://127.0.0.1:4640/api/record/stop")!
 let START_URL = URL(string: "http://127.0.0.1:4640/api/record/start")!
+let UPCOMING_URL = URL(string: "http://127.0.0.1:4640/api/upcoming")!
 
 func status(_ s: String) {
     FileHandle.standardError.write(("[panel] " + s + "\n").data(using: .utf8)!)
@@ -229,18 +235,127 @@ func meetingAppOnMic() -> String? {
     return nil
 }
 
-/// The "Mic in use · <app> — ● Record / ×" offer, shown only while idle.
-final class MicPromptController: NSObject {
-    private let panel: FloatingPanel
-    private let label = NSTextField(labelWithString: "")
-    private var candidate: String?   // app seen on the last poll, not yet confirmed
-    private var offeredApp: String?  // app the visible offer is for
+// ── Offers: "record this?" prompts shown in the corner while idle ──────────
+/// One prompt: what it says, what the primary button does, and what × does.
+/// The key identifies the offer so a re-sent one updates in place.
+struct Offer {
+    let key: String
+    let text: String
+    let action: String
+    let onAccept: () -> Void
+    let onDismiss: () -> Void
+}
+
+var startInFlight = false
+
+/// POST /api/record/start, narrating failures. `title` names the meeting.
+func startRecording(title: String?, source: String) {
+    startInFlight = true
+    var req = URLRequest(url: START_URL)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: title.map { ["title": $0] } ?? [:])
+    URLSession.shared.dataTask(with: req) { data, _, err in
+        DispatchQueue.main.async { startInFlight = false }
+        let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        if err != nil {
+            notify("Threadline isn't reachable — is npm run dev running?")
+        } else if body.contains("\"error\"") {
+            status("start failed: \(body)")
+            notify("Couldn't start recording — open Threadline for details")
+        } else {
+            status("recording started from \(source)")
+        }
+    }.resume()
+}
+
+/// "Mic in use · Zoom" after a meeting app holds the mic for two polls.
+final class MicOffer {
+    private var candidate: String?    // app seen on the last poll, not yet confirmed
     private var dismissedApp: String? // × pressed; quiet until it leaves the mic
-    private var starting = false
     private var wasRecording = false
 
+    func offer(recording: Bool, micApp: String?) -> Offer? {
+        if recording {
+            wasRecording = true
+            candidate = nil
+            return nil
+        }
+        if wasRecording {  // a take just ended: don't re-offer the call it came from
+            wasRecording = false
+            dismissedApp = micApp
+        }
+        guard let app = micApp else {
+            candidate = nil
+            dismissedApp = nil
+            return nil
+        }
+        guard app != dismissedApp else { return nil }
+        if app != candidate {  // first sighting: wait one more poll to skip blips
+            candidate = app
+            return nil
+        }
+        return Offer(key: "mic:\(app)", text: "Mic in use · \(app)", action: "● Record",
+                     onAccept: { startRecording(title: nil, source: "mic offer") },
+                     onDismiss: { [weak self] in self?.dismissedApp = app })
+    }
+}
+
+/// "Pricing sync · in 1 min" from a calendar event's lead time until five
+/// minutes after it starts. Record & join also opens the event's call link.
+struct UpcomingEvent {
+    let title: String
+    let atMs: Double
+    let endMs: Double
+    let joinURL: URL?
+    var key: String { "\(title)@\(Int64(atMs))" }
+}
+
+final class CalendarOffer {
+    var events: [UpcomingEvent] = []
+    private var handled = Set<String>()  // dismissed, accepted, or recorded through
+    private let leadMs = (Double(ProcessInfo.processInfo.environment["THREADLINE_CAL_LEAD_SEC"] ?? "") ?? 60) * 1000
+
+    private func live(_ now: Double) -> [UpcomingEvent] {
+        events.filter { now >= $0.atMs - leadMs && now <= $0.atMs + 300_000 && ($0.endMs == 0 || now < $0.endMs) }
+    }
+
+    /// A live event the user waved off: its call shouldn't trigger the mic offer either.
+    func dismissedLive(_ now: Double) -> Bool { live(now).contains { handled.contains($0.key) } }
+
+    func offer(recording: Bool, now: Double) -> Offer? {
+        let current = live(now)
+        if recording {
+            current.forEach { handled.insert($0.key) }
+            return nil
+        }
+        guard let event = current.first(where: { !handled.contains($0.key) }) else { return nil }
+        let key = event.key
+        let mins = Int(((event.atMs - now) / 60_000).rounded())
+        let when = mins >= 1 ? "in \(mins) min" : mins <= -1 ? "\(-mins) min ago" : "now"
+        return Offer(
+            key: "cal:\(key)", text: "\(event.title) · \(when)",
+            action: event.joinURL == nil ? "● Record" : "● Record & join",
+            onAccept: { [weak self] in
+                self?.handled.insert(key)
+                startRecording(title: event.title, source: "calendar offer")
+                if let url = event.joinURL { NSWorkspace.shared.open(url) }
+            },
+            onDismiss: { [weak self] in self?.handled.insert(key) })
+    }
+}
+
+/// The corner panel that shows the current offer, if any.
+final class OfferPanel: NSObject {
+    private let panel: FloatingPanel
+    private let label = NSTextField(labelWithString: "")
+    private let accept = NSButton(title: "● Record", target: nil, action: nil)
+    private var current: Offer?
+    private let size = OfferPanel.size
+    private static let size = NSSize(width: 340, height: 60)
+
     override init() {
-        let size = NSSize(width: 292, height: 60)
+        let size = OfferPanel.size
         panel = FloatingPanel(
             contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -263,93 +378,67 @@ final class MicPromptController: NSObject {
         blur.layer?.masksToBounds = true
         panel.contentView = blur
 
-        label.frame = NSRect(x: 14, y: 21, width: 164, height: 18)
         label.font = .systemFont(ofSize: 12.5, weight: .semibold)
         label.lineBreakMode = .byTruncatingTail
         blur.addSubview(label)
 
-        let record = NSButton(title: "● Record", target: self, action: #selector(recordTapped))
-        record.frame = NSRect(x: 180, y: 15, width: 72, height: 30)
-        record.bezelStyle = .rounded
-        record.contentTintColor = NSColor(red: 0.88, green: 0.27, blue: 0.24, alpha: 1)
-        record.toolTip = "Record this meeting"
-        blur.addSubview(record)
+        accept.target = self
+        accept.action = #selector(acceptTapped)
+        accept.bezelStyle = .rounded
+        accept.contentTintColor = NSColor(red: 0.88, green: 0.27, blue: 0.24, alpha: 1)
+        accept.toolTip = "Record this meeting"
+        blur.addSubview(accept)
 
         let dismiss = NSButton(title: "×", target: self, action: #selector(dismissTapped))
-        dismiss.frame = NSRect(x: 254, y: 15, width: 28, height: 30)
+        dismiss.frame = NSRect(x: size.width - 42, y: 15, width: 28, height: 30)
         dismiss.bezelStyle = .rounded
         dismiss.toolTip = "Not this one"
         blur.addSubview(dismiss)
-
-        if let screen = NSScreen.main {
-            let v = screen.visibleFrame
-            panel.setFrameOrigin(NSPoint(x: v.maxX - size.width - 16, y: v.maxY - size.height - 16))
-        }
+        layout()
     }
 
-    /// Called on the main thread after each state poll.
-    func apply(recording: Bool, micApp: String?) {
-        if recording {
-            wasRecording = true
-            hide()
-            candidate = nil
-            return
-        }
-        if wasRecording {  // a take just ended: don't re-offer the call it came from
-            wasRecording = false
-            dismissedApp = micApp
-        }
-        guard let app = micApp else {
-            hide()
-            candidate = nil
-            dismissedApp = nil
-            return
-        }
-        guard app != dismissedApp, !starting else { return }
-        if app != candidate {  // first sighting: wait one more poll to skip blips
-            candidate = app
-            return
-        }
-        if offeredApp != app {
-            offeredApp = app
-            label.stringValue = "Mic in use · \(app)"
+    /// Accept button sized to its title; the label takes the rest of the row.
+    private func layout() {
+        accept.sizeToFit()
+        let w = max(72, accept.frame.width + 8)
+        accept.frame = NSRect(x: size.width - 42 - 4 - w, y: 15, width: w, height: 30)
+        label.frame = NSRect(x: 14, y: 21, width: accept.frame.minX - 14 - 8, height: 18)
+    }
+
+    /// Show `offer` (updating in place if it's the same one), or hide when nil.
+    func show(_ offer: Offer?) {
+        guard let offer = offer else { return hide() }
+        let isNew = current?.key != offer.key
+        current = offer
+        label.stringValue = offer.text
+        if accept.title != offer.action { accept.title = offer.action; layout() }
+        if isNew || !panel.isVisible {
+            if let screen = NSScreen.main {
+                let v = screen.visibleFrame
+                panel.setFrameOrigin(NSPoint(x: v.maxX - size.width - 16, y: v.maxY - size.height - 16))
+            }
             panel.orderFrontRegardless()
-            status("\(app) is using the mic — offered to record")
+            status("offered: \(offer.text)")
         }
     }
 
     private func hide() {
+        current = nil
         guard panel.isVisible else { return }
         panel.orderOut(nil)
-        offeredApp = nil
+    }
+
+    @objc private func acceptTapped() {
+        let offer = current
+        hide()
+        offer?.onAccept()
     }
 
     @objc private func dismissTapped() {
-        dismissedApp = offeredApp
-        status("offer dismissed for \(offeredApp ?? "app")")
+        let offer = current
+        status("dismissed: \(offer?.text ?? "offer")")
         hide()
-    }
-
-    @objc private func recordTapped() {
-        guard !starting else { return }
-        starting = true
-        hide()
-        var req = URLRequest(url: START_URL)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = Data("{}".utf8)
-        URLSession.shared.dataTask(with: req) { data, _, err in
-            DispatchQueue.main.async { self.starting = false }
-            let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-            if err != nil {
-                notify("Threadline isn't reachable — is npm run dev running?")
-            } else if body.contains("\"error\"") {
-                status("start failed: \(body)")
-                notify("Couldn't start recording — open Threadline for details")
-            } else {
-                status("recording started from mic offer")
-            }
-        }.resume()
+        offer?.onDismiss()
     }
 }
 
@@ -357,7 +446,26 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory) // no Dock icon, no menu bar
 let controller = PanelController()
 let micPromptEnabled = ProcessInfo.processInfo.environment["THREADLINE_MIC_PROMPT"] != "0"
-let micPrompt = MicPromptController()
+let calPromptEnabled = ProcessInfo.processInfo.environment["THREADLINE_CAL_PROMPT"] != "0"
+let micOffer = MicOffer()
+let calendarOffer = CalendarOffer()
+let offerPanel = OfferPanel()
+
+// Upcoming events change slowly; the server caches calendar fetches anyway.
+func refreshUpcoming() {
+    guard calPromptEnabled else { return }
+    URLSession.shared.dataTask(with: UPCOMING_URL) { data, _, _ in
+        guard let data = data, let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return }
+        let events = rows.compactMap { r -> UpcomingEvent? in
+            guard let title = r["title"] as? String, let at = r["at_ms"] as? Double else { return nil }
+            return UpcomingEvent(title: title, atMs: at, endMs: r["end_ms"] as? Double ?? 0,
+                                 joinURL: (r["join_url"] as? String).flatMap(URL.init(string:)))
+        }
+        DispatchQueue.main.async { calendarOffer.events = events }
+    }.resume()
+}
+refreshUpcoming()
+Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in refreshUpcoming() }
 
 // Poll the server for recording state. Unreachable server = treat as idle.
 Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
@@ -371,11 +479,17 @@ Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
             title = obj["title"] as? String
             startedAt = obj["startedAt"] as? Double
         }
-        // Only offer when the server answered: an unreachable server can't record.
-        let micApp = micPromptEnabled && data != nil && !recording ? meetingAppOnMic() : nil
+        let serverUp = data != nil
+        let micApp = micPromptEnabled && serverUp && !recording ? meetingAppOnMic() : nil
         DispatchQueue.main.async {
             controller.apply(recording: recording, title: title, startedAt: startedAt)
-            micPrompt.apply(recording: recording, micApp: micApp)
+            // Both state machines advance every poll; calendar wins the corner.
+            let now = Date().timeIntervalSince1970 * 1000
+            let cal = calendarOffer.offer(recording: recording, now: now)
+            let mic = micOffer.offer(recording: recording, micApp: micApp)
+            // Only offer when the server answered: an unreachable server can't record.
+            guard serverUp, !startInFlight else { return offerPanel.show(nil) }
+            offerPanel.show(cal ?? (calendarOffer.dismissedLive(now) ? nil : mic))
         }
     }.resume()
 }
