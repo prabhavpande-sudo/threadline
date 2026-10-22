@@ -5,6 +5,7 @@
  *   - chat-completions structured extraction standing in for Recap
  */
 import type { Utterance, RecapRecord } from "./pyai.js";
+import type { UploadAudio } from "./audio.js";
 import { chatJson } from "./model.js";
 
 const BASE = "https://api.openai.com/v1";
@@ -34,12 +35,12 @@ export function pcm16ToWav(pcm: Buffer, sampleRate = 16000): Buffer {
 
 /** Transcribe one channel's WAV; returns utterances with offsets. */
 export async function whisperTranscribe(
-  wav: Buffer,
+  audio: UploadAudio,
   speaker: string,
   speakerRole: "agent" | "customer",
 ): Promise<Utterance[]> {
   const form = new FormData();
-  form.append("file", new Blob([new Uint8Array(wav)], { type: "audio/wav" }), "audio.wav");
+  form.append("file", new Blob([new Uint8Array(audio.data)], { type: audio.type }), audio.name);
   form.append("model", "whisper-1");
   form.append("response_format", "verbose_json");
   const res = await fetch(`${BASE}/audio/transcriptions`, {

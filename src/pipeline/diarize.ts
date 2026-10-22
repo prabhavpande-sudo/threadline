@@ -9,7 +9,7 @@
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
-import { pcm16ToWav } from "../lib/openai.js";
+import { encodeForUpload } from "../lib/audio.js";
 import { submitTranscriptionJob, awaitTranscriptionJob, PyAIError, type DiarizedSegment } from "../lib/pyai.js";
 import { candidates } from "./candidates.js";
 import { resolveCandidates, storeResolutions } from "./resolve.js";
@@ -176,7 +176,7 @@ async function diarizeInner(db: DatabaseSync, apiKey: string, meetingId: string,
       totalLines += lines.length;
 
       spend();
-      const jobId = await submitTranscriptionJob(apiKey, pcm16ToWav(readFileSync(plan.tape)), { diarize: true, vocabulary });
+      const jobId = await submitTranscriptionJob(apiKey, await encodeForUpload(readFileSync(plan.tape)), { diarize: true, vocabulary });
       setRun(db, meetingId, { job_id: jobId });
       const { segments, speakers } = await awaitTranscriptionJob(apiKey, jobId, plan.bytes / 32_000);
       if (speakers <= 1) { notes.push(`${plan.target}: one voice`); continue; }

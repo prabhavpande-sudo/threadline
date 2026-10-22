@@ -11,6 +11,8 @@
  * spots are marked UNDOCUMENTED and must be treated as optional.
  */
 
+import type { UploadAudio } from "./audio.js";
+
 const BASE = process.env.PYAI_BASE_URL ?? "https://api.pyai.com/v1";
 const WS_BASE = BASE.replace(/^http/, "ws");
 
@@ -153,11 +155,11 @@ export type DiarizedSegment = { id: number; start: number; end: number; text: st
 /** Multipart WAV upload — `call()` hardcodes JSON, so this owns its fetch. */
 export async function submitTranscriptionJob(
   apiKey: string,
-  wav: Buffer,
+  audio: UploadAudio,
   opts: { diarize?: boolean; vocabulary?: string[] } = {},
 ): Promise<string> {
   const form = new FormData();
-  form.append("audio", new Blob([new Uint8Array(wav)], { type: "audio/wav" }), "audio.wav");
+  form.append("audio", new Blob([new Uint8Array(audio.data)], { type: audio.type }), audio.name);
   form.append("model", "pyai-hear");
   if (opts.diarize) form.append("diarize", "true");
   // One comma-separated string; PyAI keeps the first five usable terms.

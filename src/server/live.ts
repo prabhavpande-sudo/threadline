@@ -11,6 +11,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, createWriteStream, readFileSync, type WriteStream } from "node:fs";
 import WebSocket from "ws";
 import { hasOpenAI, pcm16ToWav, whisperTranscribe } from "../lib/openai.js";
+import { encodeForUpload } from "../lib/audio.js";
 import { hasLocalAsr, localTranscribe, localTranscribeOnly } from "../lib/local-asr.js";
 import { meetingVocabulary } from "../pipeline/vocabulary.js";
 import type { DatabaseSync } from "node:sqlite";
@@ -301,7 +302,7 @@ export class LiveSession {
           if (pcm.length < 16000) continue; // under half a second of audio
           const utts = engine === "on-device"
             ? await localTranscribe(pcm16ToWav(pcm), speaker, ROLE[speaker], vocabulary)
-            : await whisperTranscribe(pcm16ToWav(pcm), speaker, ROLE[speaker]);
+            : await whisperTranscribe(await encodeForUpload(pcm), speaker, ROLE[speaker]);
           this.finals.push(...utts.map((u) => ({ ...u, offset_s: this.offsetBase + u.offset_s })));
         }
         this.finals.sort((a, b) => a.offset_s - b.offset_s);
