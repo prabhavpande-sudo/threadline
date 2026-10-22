@@ -17,6 +17,7 @@ import { projectGraph } from "./project.js";
 import { relateEntities } from "./resolve.js";
 import { indexMeeting } from "./chunker.js";
 import { reindexMeeting } from "./extract.js";
+import { meetingVocabulary } from "./vocabulary.js";
 import { groundedIn, type StepRecord } from "../lib/harness.js";
 import { recordRun } from "../lib/runlog.js";
 import { because, publicReason, reasonFrom } from "../lib/reasons.js";
@@ -158,6 +159,8 @@ async function diarizeInner(db: DatabaseSync, apiKey: string, meetingId: string,
   let totalSpeakers = 0, totalMatched = 0, totalLines = 0, anyRewrite = false;
   let callSegs: DiarizedSegment[] = []; // ch0's turns — the bleed-dedup reference
   const notes: string[] = [];
+  // Names this meeting is likely to say, so the diarized transcript spells them right.
+  const vocabulary = meetingVocabulary(db, meetingId);
   try {
     for (const plan of plans) {
       const lines = db
@@ -168,7 +171,7 @@ async function diarizeInner(db: DatabaseSync, apiKey: string, meetingId: string,
       totalLines += lines.length;
 
       spend();
-      const jobId = await submitTranscriptionJob(apiKey, pcm16ToWav(readFileSync(plan.tape)), { diarize: true });
+      const jobId = await submitTranscriptionJob(apiKey, pcm16ToWav(readFileSync(plan.tape)), { diarize: true, vocabulary });
       setRun(db, meetingId, { job_id: jobId });
       const { segments, speakers } = await awaitTranscriptionJob(apiKey, jobId, plan.bytes / 32_000);
       if (speakers <= 1) { notes.push(`${plan.target}: one voice`); continue; }

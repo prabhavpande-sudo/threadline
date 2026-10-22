@@ -154,12 +154,14 @@ export type DiarizedSegment = { id: number; start: number; end: number; text: st
 export async function submitTranscriptionJob(
   apiKey: string,
   wav: Buffer,
-  opts: { diarize?: boolean } = {},
+  opts: { diarize?: boolean; vocabulary?: string[] } = {},
 ): Promise<string> {
   const form = new FormData();
   form.append("audio", new Blob([new Uint8Array(wav)], { type: "audio/wav" }), "audio.wav");
   form.append("model", "pyai-hear");
   if (opts.diarize) form.append("diarize", "true");
+  // One comma-separated string; PyAI keeps the first five usable terms.
+  if (opts.vocabulary?.length) form.append("vocabulary", opts.vocabulary.join(", "));
   const res = await fetch(`${BASE}/transcription/jobs`, {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}` },
