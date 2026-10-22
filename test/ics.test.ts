@@ -1,7 +1,7 @@
 /** Calendar-link (ICS) parsing: fixed window, no network, no Date.now. */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseIcs } from "../src/server/ics.js";
+import { parseIcs, findJoinUrl } from "../src/server/ics.js";
 
 // Window: 2026-08-14 00:00 → 2026-08-16 00:00 UTC
 const WIN_START = Date.UTC(2026, 7, 14);
@@ -82,4 +82,34 @@ test("events outside the window are dropped, results sorted ascending", () => {
   );
   const out = parseIcs(ics, WIN_START, WIN_END);
   assert.deepEqual(out.map((e) => e.title), ["First", "Second"]);
+});
+
+test("each event carries its call link, from whichever field holds it", () => {
+  const ics = wrap(
+    "BEGIN:VEVENT\r\nDTSTART:20260814T090000Z\r\nSUMMARY:Meet sync\r\n" +
+      "X-GOOGLE-CONFERENCE:https://meet.google.com/abc-defg-hij\r\nEND:VEVENT\r\n" +
+      "BEGIN:VEVENT\r\nDTSTART:20260814T100000Z\r\nSUMMARY:Zoom call\r\n" +
+      "DESCRIPTION:Join here: https://saaslabs.zoom.us/j/81234567890?pwd=AbC123.\\nThanks\r\nEND:VEVENT\r\n" +
+      "BEGIN:VEVENT\r\nDTSTART:20260814T110000Z\r\nSUMMARY:Teams review\r\n" +
+      "DESCRIPTION:Click <https://teams.microsoft.com/l/meetup-join/19%3ameeting_x%40thread.v2/0> to join\r\nEND:VEVENT\r\n" +
+      "BEGIN:VEVENT\r\nDTSTART:20260814T120000Z\r\nSUMMARY:Lunch\r\nLOCATION:Cafeteria\r\nEND:VEVENT\r\n",
+  );
+  assert.deepEqual(
+    parseIcs(ics, WIN_START, WIN_END).map((e) => [e.title, e.join_url ?? null]),
+    [
+      ["Meet sync", "https://meet.google.com/abc-defg-hij"],
+      ["Zoom call", "https://saaslabs.zoom.us/j/81234567890?pwd=AbC123"],
+      ["Teams review", "https://teams.microsoft.com/l/meetup-join/19%3ameeting_x%40thread.v2/0"],
+      ["Lunch", null],
+    ],
+  );
+});
+
+test("join links: the conference field wins over prose, and non-call links are ignored", () => {
+  assert.equal(
+    findJoinUrl(["https://meet.google.com/abc-defg-hij", "Backup: https://us02web.zoom.us/j/123"]),
+    "https://meet.google.com/abc-defg-hij",
+  );
+  assert.equal(findJoinUrl(["Agenda: https://docs.google.com/document/d/xyz", undefined]), undefined);
+  assert.equal(findJoinUrl(["(https://acme.webex.com/meet/raj)"]), "https://acme.webex.com/meet/raj");
 });

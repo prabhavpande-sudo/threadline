@@ -8,7 +8,28 @@
  */
 import type { DatabaseSync } from "node:sqlite";
 
-export type CalEvent = { title: string; at_ms: number; end_ms: number; participants: string };
+export type CalEvent = { title: string; at_ms: number; end_ms: number; participants: string; join_url?: string };
+
+// Video-call links, most specific first. Trailing punctuation from prose
+// ("join here: <link>.") is trimmed by the caller.
+const JOIN_PATTERNS = [
+  /https:\/\/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}/i,
+  /https:\/\/[\w.-]*zoom\.us\/(?:j|my|w|s)\/[^\s"'<>]+/i,
+  /https:\/\/teams\.(?:microsoft|live)\.com\/(?:l\/meetup-join|meet)\/[^\s"'<>]+/i,
+  /https:\/\/[\w.-]+\.webex\.com\/[^\s"'<>]+/i,
+];
+
+/** First video-call link in the given fields, searched in priority order. */
+export function findJoinUrl(fields: (string | undefined)[]): string | undefined {
+  for (const text of fields) {
+    if (!text) continue;
+    for (const p of JOIN_PATTERNS) {
+      const m = text.match(p);
+      if (m) return m[0].replace(/[).,;\]]+$/, "");
+    }
+  }
+  return undefined;
+}
 
 const META_KEY = "gcal_ics_url";
 
@@ -106,10 +127,14 @@ export function parseIcs(text: string, winStart: number, winEnd: number): CalEve
     const durMs = end != null && end > start ? end - start : 0;
     const title = e.SUMMARY ? unescapeText(e.SUMMARY.value) : "(untitled)";
     const participants = attendees.join(", ");
+    const join_url = findJoinUrl([
+      e["X-GOOGLE-CONFERENCE"]?.value, e.LOCATION && unescapeText(e.LOCATION.value), e.URL?.value,
+      e.DESCRIPTION && unescapeText(e.DESCRIPTION.value),
+    ]);
     const ex = new Set(exdates);
     const push = (at: number) => {
       if (at >= winStart && at <= winEnd && !ex.has(at))
-        out.push({ title, at_ms: at, end_ms: durMs ? at + durMs : 0, participants });
+        out.push({ title, at_ms: at, end_ms: durMs ? at + durMs : 0, participants, ...(join_url && { join_url }) });
     };
     if (!e.RRULE) return push(start);
 
