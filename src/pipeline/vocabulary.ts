@@ -43,7 +43,7 @@ export function meetingVocabulary(db: DatabaseSync, meetingId: string): string[]
           `SELECT e.label FROM entity_mentions em
              JOIN entities e ON e.id = em.entity_id
              JOIN meeting_projects mp ON mp.meeting_id = em.meeting_id
-           WHERE mp.project_id IN (${inThreads}) AND e.kind = ? AND e.merged_into IS NULL
+           WHERE mp.project_id IN (${inThreads}) AND e.kind = ? AND e.merged_into IS NULL AND em.gate = 'passed'
            GROUP BY e.id ORDER BY count(*) DESC LIMIT 10`,
         )
         .all(...ids, kind) as { label: string }[];
@@ -56,7 +56,7 @@ export function meetingVocabulary(db: DatabaseSync, meetingId: string): string[]
         `SELECT e.label FROM entity_mentions em
            JOIN entities e ON e.id = em.entity_id
          WHERE em.meeting_id IN (SELECT id FROM meetings WHERE id != ? ORDER BY started_at DESC LIMIT ?)
-           AND e.kind = 'person' AND e.merged_into IS NULL
+           AND e.kind = 'person' AND e.merged_into IS NULL AND em.gate = 'passed'
          GROUP BY e.id ORDER BY count(*) DESC LIMIT 10`,
       )
       .all(meetingId, RECENT_MEETINGS) as { label: string }[];
