@@ -5,7 +5,7 @@
 **Granola takes notes about your meeting. Threadline takes your side in it.**
 
 Local-first meeting brain. No bot in your call — audio is captured on your
-laptop, both sides, from any app, with a double-tap of `fn`. Every meeting
+laptop, both sides, from any app, with one keyboard shortcut. Every meeting
 becomes notes with receipts, a to-do list that writes itself, and a node in a
 3D atlas of everything you've ever discussed.
 
@@ -42,15 +42,15 @@ Granola is the bar for meeting notes. Threadline starts where it stops:
 
 |  | **Granola** | **Threadline** |
 |---|---|---|
-| Bot joins your call | No bot (audio via the Mac app) | No bot — and recording starts from **any app** with a double-tap of `fn` |
+| Bot joins your call | No bot — the Mac app records system audio and offers to start when a meeting app opens the mic | No bot — recording starts from **any app** with one keyboard shortcut |
 | Where your data lives | Their cloud | **Your laptop** — one SQLite file; audio goes only to the speech API you configured |
 | Notes | AI-enhanced notes | Notes where **every claim carries a receipt** — click it, land on the transcript line; ungrounded claims are blocked, not shipped |
 | Honesty about AI output | — | Four named exits per run (`shipped / partial / deadline / failed`) shown in the UI; gates, budgets, capped retries |
 | Memory across meetings | Folders + chat | A **Brain**: a rotating atlas of meetings, people and topics, spotlight search, per-node context export, decision lineage drawn as a git graph |
 | Ask your history | Chat over notes | **Needle** — cross-meeting Q&A with receipts, plus **live assist in-call**, scoped to the meeting's thread |
-| Your AI tools | Closed | **MCP server built in** — Claude Code, Claude Desktop or Cursor query your brain locally, no API keys, evidence-only |
+| Your AI tools | MCP server, public API and webhooks — served from their cloud | **MCP server built in** — Claude Code, Claude Desktop or Cursor query your brain locally, no API keys, evidence-only |
 | To-dos | In the notes | A **loose-ends list that writes itself**, threaded across meetings, prepping your next meeting automatically |
-| Speaker ID | Per-meeting | Batch diarization on the local tape; name a voice once, it propagates everywhere |
+| Speaker ID | Live names read from the Zoom / Teams / Meet window, plus on-device diarization | Batch diarization on the local tape; name a voice once, it propagates everywhere |
 | Price / license | $18/user/mo | **MIT, open source, self-hosted** |
 
 ![Notes with receipts — every claim cites its transcript line](docs/receipts.png)
@@ -82,12 +82,14 @@ receipts, graph — exactly like recorded audio.
 
 ## Record from anywhere
 
-Double-tap `fn` (or bind a macOS Shortcut to `scripts/record-toggle.sh`) from
-any app: a native floating panel appears with the timer and a Stop button, and
+Bind a macOS Shortcut to `scripts/record-toggle.sh` (Shortcuts app → new
+Shortcut → Run Shell Script → Add Keyboard Shortcut, e.g. ⌘⇧R; the same combo
+starts and stops) and press it from any app: a native floating panel appears
+with the timer and a Stop button, and
 the browser companion pops out with the live transcript, a mode picker, a
 thread picker, and an Ask box that answers from that thread's history while
 you're still on the call. Meetings you never name title themselves from their
-own content; takes under 15 seconds are discarded as accidental taps.
+own content; takes under 15 seconds are discarded as accidental starts.
 
 Multi-party calls get **speaker identification** after each take: the saved
 tape is diarized (PyAI batch job) and split into Speaker 1/2/3 — the far side
@@ -96,7 +98,8 @@ voice once and it propagates through transcript, entities, graph and search;
 the notes rebuild themselves against the diarized transcript.
 
 Capture needs **Screen Recording + Microphone** permission for the app that
-owns `npm run dev`; the global hotkey needs **Accessibility**.
+owns `npm run dev`. The shortcut runs through the Shortcuts app, which needs
+**Allow Running Scripts** turned on (Shortcuts → Settings → Advanced).
 
 ## Give your Claude this brain (MCP)
 
