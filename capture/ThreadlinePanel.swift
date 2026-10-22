@@ -5,15 +5,24 @@
 // the web UI's Record button, a calendar notification). Red dot, title,
 // elapsed timer, and a Stop button that ends the take. Hides itself the
 // moment the recording stops, so stopping via the Shortcut also dismisses it.
+//
+// While idle it also watches which apps hold the microphone (CoreAudio's
+// process list, macOS 14.2+). When a meeting app keeps the mic for two polls,
+// it offers "● Record" in the same corner; × stays quiet until that app lets
+// go of the mic. It never starts a recording by itself.
+//   THREADLINE_MIC_PROMPT=0   turn the offer off
+//   THREADLINE_MIC_APPS=a,b   bundle-ID prefixes that count as meeting apps
 // Needs no permissions.
 //
 // Build:  swiftc -O capture/ThreadlinePanel.swift -o capture/threadline-panel
 
 import Cocoa
+import CoreAudio
 import Foundation
 
 let STATE_URL = URL(string: "http://127.0.0.1:4640/api/record/state")!
 let STOP_URL = URL(string: "http://127.0.0.1:4640/api/record/stop")!
+let START_URL = URL(string: "http://127.0.0.1:4640/api/record/start")!
 
 func status(_ s: String) {
     FileHandle.standardError.write(("[panel] " + s + "\n").data(using: .utf8)!)
@@ -170,9 +179,185 @@ final class PanelController: NSObject {
     }
 }
 
+// ── Meeting apps on the microphone ─────────────────────────────────────────
+// Browsers count because Meet runs in one; their mic is held by a helper
+// process whose bundle ID extends the browser's, hence prefix matching.
+// Slack is left out: its helper can hold the mic outside a huddle, which
+// would mean a standing false offer. Add it via THREADLINE_MIC_APPS.
+let MEETING_APPS: [(prefix: String, name: String)] = {
+    if let custom = ProcessInfo.processInfo.environment["THREADLINE_MIC_APPS"], !custom.isEmpty {
+        return custom.split(separator: ",").map { (String($0).trimmingCharacters(in: .whitespaces), "meeting app") }
+    }
+    return [
+        ("us.zoom.", "Zoom"), ("com.microsoft.teams", "Teams"), ("com.apple.FaceTime", "FaceTime"), ("com.cisco.", "Webex"), ("Cisco-Systems.Spark", "Webex"),
+        ("com.hnc.Discord", "Discord"), ("net.whatsapp.WhatsApp", "WhatsApp"),
+        ("com.google.Chrome", "Chrome"), ("com.apple.Safari", "Safari"), ("com.apple.WebKit", "Safari"),
+        ("company.thebrowser.", "Arc"), ("com.microsoft.edgemac", "Edge"), ("org.mozilla.firefox", "Firefox"),
+        ("com.brave.Browser", "Brave"),
+    ]
+}()
+
+func audioProperty<T>(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, _ initial: T) -> T? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var value = initial
+    var size = UInt32(MemoryLayout<T>.size)
+    let code = withUnsafeMutableBytes(of: &value) {
+        AudioObjectGetPropertyData(object, &address, 0, nil, &size, $0.baseAddress!)
+    }
+    return code == noErr ? value : nil
+}
+
+/// Display name of the first meeting app currently capturing from any input, or nil.
+func meetingAppOnMic() -> String? {
+    guard #available(macOS 14.2, *) else { return nil }
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyProcessObjectList,
+        mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    let system = AudioObjectID(kAudioObjectSystemObject)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(system, &address, 0, nil, &size) == noErr, size > 0 else { return nil }
+    var processes = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(system, &address, 0, nil, &size, &processes) == noErr else { return nil }
+    for process in processes {
+        guard audioProperty(process, kAudioProcessPropertyIsRunningInput, UInt32(0)) == 1,
+              let ref = audioProperty(process, kAudioProcessPropertyBundleID, Unmanaged<CFString>?.none) ?? nil
+        else { continue }
+        let bundleID = ref.takeRetainedValue() as String
+        if let app = MEETING_APPS.first(where: { bundleID.hasPrefix($0.prefix) }) { return app.name }
+    }
+    return nil
+}
+
+/// The "Mic in use · <app> — ● Record / ×" offer, shown only while idle.
+final class MicPromptController: NSObject {
+    private let panel: FloatingPanel
+    private let label = NSTextField(labelWithString: "")
+    private var candidate: String?   // app seen on the last poll, not yet confirmed
+    private var offeredApp: String?  // app the visible offer is for
+    private var dismissedApp: String? // × pressed; quiet until it leaves the mic
+    private var starting = false
+    private var wasRecording = false
+
+    override init() {
+        let size = NSSize(width: 292, height: 60)
+        panel = FloatingPanel(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered, defer: true
+        )
+        super.init()
+        panel.isFloatingPanel = true
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.hidesOnDeactivate = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+
+        let blur = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        blur.material = .hudWindow
+        blur.state = .active
+        blur.wantsLayer = true
+        blur.layer?.cornerRadius = 14
+        blur.layer?.masksToBounds = true
+        panel.contentView = blur
+
+        label.frame = NSRect(x: 14, y: 21, width: 164, height: 18)
+        label.font = .systemFont(ofSize: 12.5, weight: .semibold)
+        label.lineBreakMode = .byTruncatingTail
+        blur.addSubview(label)
+
+        let record = NSButton(title: "● Record", target: self, action: #selector(recordTapped))
+        record.frame = NSRect(x: 180, y: 15, width: 72, height: 30)
+        record.bezelStyle = .rounded
+        record.contentTintColor = NSColor(red: 0.88, green: 0.27, blue: 0.24, alpha: 1)
+        record.toolTip = "Record this meeting"
+        blur.addSubview(record)
+
+        let dismiss = NSButton(title: "×", target: self, action: #selector(dismissTapped))
+        dismiss.frame = NSRect(x: 254, y: 15, width: 28, height: 30)
+        dismiss.bezelStyle = .rounded
+        dismiss.toolTip = "Not this one"
+        blur.addSubview(dismiss)
+
+        if let screen = NSScreen.main {
+            let v = screen.visibleFrame
+            panel.setFrameOrigin(NSPoint(x: v.maxX - size.width - 16, y: v.maxY - size.height - 16))
+        }
+    }
+
+    /// Called on the main thread after each state poll.
+    func apply(recording: Bool, micApp: String?) {
+        if recording {
+            wasRecording = true
+            hide()
+            candidate = nil
+            return
+        }
+        if wasRecording {  // a take just ended: don't re-offer the call it came from
+            wasRecording = false
+            dismissedApp = micApp
+        }
+        guard let app = micApp else {
+            hide()
+            candidate = nil
+            dismissedApp = nil
+            return
+        }
+        guard app != dismissedApp, !starting else { return }
+        if app != candidate {  // first sighting: wait one more poll to skip blips
+            candidate = app
+            return
+        }
+        if offeredApp != app {
+            offeredApp = app
+            label.stringValue = "Mic in use · \(app)"
+            panel.orderFrontRegardless()
+            status("\(app) is using the mic — offered to record")
+        }
+    }
+
+    private func hide() {
+        guard panel.isVisible else { return }
+        panel.orderOut(nil)
+        offeredApp = nil
+    }
+
+    @objc private func dismissTapped() {
+        dismissedApp = offeredApp
+        status("offer dismissed for \(offeredApp ?? "app")")
+        hide()
+    }
+
+    @objc private func recordTapped() {
+        guard !starting else { return }
+        starting = true
+        hide()
+        var req = URLRequest(url: START_URL)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = Data("{}".utf8)
+        URLSession.shared.dataTask(with: req) { data, _, err in
+            DispatchQueue.main.async { self.starting = false }
+            let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            if err != nil {
+                notify("Threadline isn't reachable — is npm run dev running?")
+            } else if body.contains("\"error\"") {
+                status("start failed: \(body)")
+                notify("Couldn't start recording — open Threadline for details")
+            } else {
+                status("recording started from mic offer")
+            }
+        }.resume()
+    }
+}
+
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory) // no Dock icon, no menu bar
 let controller = PanelController()
+let micPromptEnabled = ProcessInfo.processInfo.environment["THREADLINE_MIC_PROMPT"] != "0"
+let micPrompt = MicPromptController()
 
 // Poll the server for recording state. Unreachable server = treat as idle.
 Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
@@ -186,7 +371,12 @@ Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
             title = obj["title"] as? String
             startedAt = obj["startedAt"] as? Double
         }
-        DispatchQueue.main.async { controller.apply(recording: recording, title: title, startedAt: startedAt) }
+        // Only offer when the server answered: an unreachable server can't record.
+        let micApp = micPromptEnabled && data != nil && !recording ? meetingAppOnMic() : nil
+        DispatchQueue.main.async {
+            controller.apply(recording: recording, title: title, startedAt: startedAt)
+            micPrompt.apply(recording: recording, micApp: micApp)
+        }
     }.resume()
 }
 
