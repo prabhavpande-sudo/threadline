@@ -9,6 +9,7 @@ import { readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import path from "node:path";
 import { openDb } from "../lib/db.js";
 import { LiveSession, type LiveEvent } from "./live.js";
+import { hasLocalAsr, localTranscribeOnly } from "../lib/local-asr.js";
 import { ensureApiKey, writeEnvVar } from "../lib/firstrun.js";
 import { processMeeting, reindexMeeting, type MeetingInput } from "../pipeline/extract.js";
 import { findOccurrences, applyCorrection, undoCorrection, detectWordSwap } from "../pipeline/corrections.js";
@@ -128,7 +129,9 @@ type Handler = (params: URLSearchParams, body: unknown) => unknown | Promise<unk
 
 function startRecording(opts: { title?: string; mode?: string; meeting_id?: string }) {
   if (live) return { error: "already recording" };
-  if (!pyaiKey()) return { error: "PyAI key not configured — run onboarding from the profile menu" };
+  // On-device mode transcribes without the speech API, so it needs no key.
+  if (!pyaiKey() && !(localTranscribeOnly() && hasLocalAsr()))
+    return { error: "PyAI key not configured — run onboarding from the profile menu" };
   recentEvents.length = 0;
   // Resume: keep recording into an existing meeting — new audio lands after
   // what's already there, and stop re-stitches the whole transcript.

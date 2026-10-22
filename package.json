@@ -18,6 +18,7 @@
     "typecheck": "tsc --noEmit",
     "build:capture": "swiftc -O capture/ThreadlineCapture.swift -o capture/threadline-capture && swiftc -O capture/ThreadlinePanel.swift -o capture/threadline-panel",
     "seed": "tsx src/cli/seed.ts",
+    "setup:local-asr": "scripts/setup-local-asr.sh",
     "mcp": "tsx src/mcp/server.ts",
     "brain-md": "tsx src/cli/brain-md.ts"
   },

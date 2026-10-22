@@ -11,6 +11,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, createWriteStream, readFileSync, type WriteStream } from "node:fs";
 import WebSocket from "ws";
 import { hasOpenAI, pcm16ToWav, whisperTranscribe } from "../lib/openai.js";
+import { hasLocalAsr, localTranscribe, localTranscribeOnly } from "../lib/local-asr.js";
+import { meetingVocabulary } from "../pipeline/vocabulary.js";
 import type { DatabaseSync } from "node:sqlite";
 import { streamUrl, type Utterance } from "../lib/pyai.js";
 import { processMeeting } from "../pipeline/extract.js";
@@ -87,10 +89,13 @@ export class LiveSession {
       )
       .run(this.meetingId, this.title, this.mode, this.startedAt);
     mkdirSync("data/recordings", { recursive: true });
+    const local = localTranscribeOnly();
     for (const ch of [0, 1]) {
       this.tapes[ch] = createWriteStream(`data/recordings/${this.meetingId}${this.tapeSuffix}-ch${ch}.pcm`);
-      this.openSocket(ch);
+      if (!local) this.openSocket(ch);
     }
+    if (local)
+      this.emit({ type: "status", message: "On-device transcription: audio stays on this Mac; the transcript appears after the call" });
 
     this.helper = spawn(bin, [], { stdio: ["pipe", "pipe", "pipe"] });
     this.helper.stderr!.on("data", (d: Buffer) =>
@@ -244,21 +249,35 @@ export class LiveSession {
     for (const t of this.tapes) t?.end();
 
     this.finals.sort((a, b) => a.offset_s - b.offset_s);
-    if (this.finals.length === 0 && hasOpenAI()) {
-      // PyAI produced nothing (outage, dead key) — fall back to Whisper over the tape.
-      this.emit({ type: "status", message: "PyAI produced no transcript — falling back to Whisper over the saved recording" });
+    // Transcribe the saved tapes when the stream produced nothing: always in
+    // local mode, otherwise as the outage fallback. On-device first; the cloud
+    // Whisper fallback only outside local mode.
+    const local = localTranscribeOnly();
+    const engine = hasLocalAsr() ? "on-device" : !local && hasOpenAI() ? "cloud Whisper" : null;
+    if (this.finals.length === 0 && engine) {
+      this.emit({
+        type: "status",
+        message: local
+          ? "Transcribing the recording on this Mac…"
+          : `PyAI produced no transcript — falling back to ${engine} transcription of the saved recording`,
+      });
       try {
+        const vocabulary = engine === "on-device" ? meetingVocabulary(this.db, this.meetingId) : [];
         for (const [ch, speaker] of [[0, "Them"], [1, "You"]] as const) {
           const pcm = readFileSync(`data/recordings/${this.meetingId}${this.tapeSuffix}-ch${ch}.pcm`);
           if (pcm.length < 16000) continue; // under half a second of audio
-          const utts = await whisperTranscribe(pcm16ToWav(pcm), speaker, ROLE[speaker]);
+          const utts = engine === "on-device"
+            ? await localTranscribe(pcm16ToWav(pcm), speaker, ROLE[speaker], vocabulary)
+            : await whisperTranscribe(pcm16ToWav(pcm), speaker, ROLE[speaker]);
           this.finals.push(...utts.map((u) => ({ ...u, offset_s: this.offsetBase + u.offset_s })));
         }
         this.finals.sort((a, b) => a.offset_s - b.offset_s);
-        if (this.finals.length) this.emit({ type: "status", message: `Whisper fallback recovered ${this.finals.length} lines` });
+        if (this.finals.length) this.emit({ type: "status", message: `${engine} transcription recovered ${this.finals.length} lines` });
       } catch (e) {
-        this.emit({ type: "status", message: `Whisper fallback failed: ${e instanceof Error ? e.message : e}` });
+        this.emit({ type: "status", message: `${engine} transcription failed: ${e instanceof Error ? e.message : e}` });
       }
+    } else if (this.finals.length === 0 && local) {
+      this.emit({ type: "status", message: "On-device transcription isn't set up — run npm run setup:local-asr" });
     }
     if (this.finals.length === 0) {
       // Same symptom, three causes — name the one that actually happened.
