@@ -1,14 +1,18 @@
 // ThreadlineCapture — captures BOTH sides of a meeting with no bot in the call:
-//   channel 0: system audio (the other people, via ScreenCaptureKit)
+//   channel 0: system audio (the other people, via a CoreAudio process tap on
+//              macOS 14.2+, ScreenCaptureKit otherwise or if the tap fails)
 //   channel 1: microphone   (you, via AVAudioEngine)
 //
 // Output on stdout, framed: [1 byte channel][4 bytes LE payload length][PCM16 mono @16kHz]
 // Status lines go to stderr. Stop with SIGINT/SIGTERM or closing stdin.
+// THREADLINE_SYSTEM_AUDIO=sck forces ScreenCaptureKit; =tap forbids the fallback.
 //
 // Build:  swiftc -O capture/ThreadlineCapture.swift -o capture/threadline-capture
-// Needs: macOS 13+, Screen Recording + Microphone permission for the terminal.
+// Needs: macOS 13+, Microphone permission for the terminal, plus System Audio
+// Recording (process tap) or Screen Recording (ScreenCaptureKit fallback).
 
 import AVFoundation
+import CoreAudio
 import CoreMedia
 import Foundation
 import ScreenCaptureKit
@@ -41,6 +45,7 @@ final class Downsampler {
         if converter == nil || inFormat != buffer.format {
             inFormat = buffer.format
             converter = AVAudioConverter(from: buffer.format, to: outFormat)
+            converter?.downmix = true  // mix stereo to mono instead of keeping only the left channel
         }
         guard let conv = converter else { return Data() }
         let ratio = TARGET_RATE / buffer.format.sampleRate
@@ -125,7 +130,136 @@ final class SystemAudio: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
+// ── System audio via process tap (channel 0, macOS 14.2+) ─────────────────
+// Taps the system output mix (minus this process) into a private aggregate
+// device. Needs only the System Audio Recording permission, not Screen
+// Recording. The tap and aggregate are private to this process, so the OS
+// tears them down when it exits.
+struct CoreAudioError: Error, CustomStringConvertible {
+    let step: String
+    let code: OSStatus
+    var description: String { "\(step) failed (OSStatus \(code))" }
+}
+
+func check(_ code: OSStatus, _ step: String) throws {
+    if code != noErr { throw CoreAudioError(step: step, code: code) }
+}
+
+func getProperty<T>(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector,
+                    qualifier: UnsafeRawPointer? = nil, qualifierSize: UInt32 = 0,
+                    _ initial: T) throws -> T {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var value = initial
+    var size = UInt32(MemoryLayout<T>.size)
+    let code = withUnsafeMutableBytes(of: &value) {
+        AudioObjectGetPropertyData(object, &address, qualifierSize, qualifier, &size, $0.baseAddress!)
+    }
+    try check(code, "read property \(selector)")
+    return value
+}
+
+@available(macOS 14.2, *)
+final class SystemAudioTap {
+    private var tapID = AudioObjectID(kAudioObjectUnknown)
+    private var aggregateID = AudioObjectID(kAudioObjectUnknown)
+    private var procID: AudioDeviceIOProcID?
+    private let down = Downsampler()
+
+    func start() throws {
+        var pid = getpid()
+        let me = try getProperty(AudioObjectID(kAudioObjectSystemObject),
+                                 kAudioHardwarePropertyTranslatePIDToProcessObject,
+                                 qualifier: &pid, qualifierSize: UInt32(MemoryLayout<pid_t>.size),
+                                 AudioObjectID(kAudioObjectUnknown))
+        let tap = CATapDescription(stereoGlobalTapButExcludeProcesses: me == kAudioObjectUnknown ? [] : [me])
+        tap.uuid = UUID()
+        tap.isPrivate = true
+        tap.muteBehavior = .unmuted
+        try check(AudioHardwareCreateProcessTap(tap, &tapID), "create process tap")
+
+        let output = try getProperty(AudioObjectID(kAudioObjectSystemObject),
+                                     kAudioHardwarePropertyDefaultSystemOutputDevice,
+                                     AudioObjectID(kAudioObjectUnknown))
+        guard let uidRef = try getProperty(output, kAudioDevicePropertyDeviceUID, Unmanaged<CFString>?.none) else {
+            throw CoreAudioError(step: "read output device UID", code: kAudioHardwareBadDeviceError)
+        }
+        let outputUID = uidRef.takeRetainedValue() as String
+        let description: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "Threadline system audio",
+            kAudioAggregateDeviceUIDKey: UUID().uuidString,
+            kAudioAggregateDeviceMainSubDeviceKey: outputUID,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outputUID]],
+            kAudioAggregateDeviceTapListKey: [
+                [kAudioSubTapDriftCompensationKey: true, kAudioSubTapUIDKey: tap.uuid.uuidString],
+            ],
+        ]
+        try check(AudioHardwareCreateAggregateDevice(description as CFDictionary, &aggregateID),
+                  "create aggregate device")
+
+        var asbd = try getProperty(tapID, kAudioTapPropertyFormat, AudioStreamBasicDescription())
+        guard let format = AVAudioFormat(streamDescription: &asbd) else {
+            throw CoreAudioError(step: "read tap format", code: kAudioHardwareUnsupportedOperationError)
+        }
+        let down = self.down
+        try check(AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, DispatchQueue(label: "tap")) {
+            _, input, _, _, _ in
+            guard let buf = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: input, deallocator: nil)
+            else { return }
+            emit(0, down.convert(buf))
+        }, "create IO proc")
+        try check(AudioDeviceStart(aggregateID, procID), "start aggregate device")
+        status("system audio capturing via process tap at \(Int(format.sampleRate))Hz")
+    }
+}
+
+/// System Audio Recording permission for this process's responsible app, via the
+/// private TCC preflight (0 = granted). An unauthorized tap delivers silence
+/// rather than an error, so auto mode only taps when this confirms access.
+func systemAudioRecordingGranted() -> Bool? {
+    typealias Preflight = @convention(c) (CFString, CFDictionary?) -> Int
+    guard let tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC", RTLD_NOW),
+          let sym = dlsym(tcc, "TCCAccessPreflight") else { return nil }
+    return unsafeBitCast(sym, to: Preflight.self)("kTCCServiceAudioCapture" as CFString, nil) == 0
+}
+
+/// Process tap first; ScreenCaptureKit when the tap is unavailable, unpermitted or fails.
+func startSystemAudio() async {
+    let mode = ProcessInfo.processInfo.environment["THREADLINE_SYSTEM_AUDIO"] ?? "auto"
+    let permitted = systemAudioRecordingGranted()
+    if mode == "auto" && permitted != true {
+        status(permitted == nil
+            ? "can't confirm System Audio Recording permission — using ScreenCaptureKit"
+            : "no System Audio Recording permission — using ScreenCaptureKit")
+    }
+    if mode == "tap" || (mode == "auto" && permitted == true) {
+        if #available(macOS 14.2, *) {
+            let tap = SystemAudioTap()
+            do {
+                try tap.start()
+                activeTap = tap
+                return
+            } catch {
+                status("process tap unavailable: \(error)")
+                if mode == "tap" { return }
+                status("falling back to ScreenCaptureKit")
+            }
+        }
+    }
+    do {
+        try await sys.start()
+    } catch {
+        status("system audio failed: \(error.localizedDescription)")
+        status("grant Screen Recording permission: System Settings → Privacy & Security → Screen Recording")
+        // Mic-only is still useful; don't exit.
+    }
+}
+
 // ── Lifecycle ─────────────────────────────────────────────────────────────
+var activeTap: AnyObject?
 let sys = SystemAudio()
 signal(SIGINT) { _ in status("stopping"); exit(0) }
 signal(SIGTERM) { _ in status("stopping"); exit(0) }
@@ -137,13 +271,7 @@ DispatchQueue.global().async {
 }
 
 Task {
-    do {
-        try await sys.start()
-    } catch {
-        status("system audio failed: \(error.localizedDescription)")
-        status("grant Screen Recording permission: System Settings → Privacy & Security → Screen Recording")
-        // Mic-only is still useful; don't exit.
-    }
+    await startSystemAudio()
     startMic()
 }
 RunLoop.main.run()

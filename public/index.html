@@ -2083,7 +2083,7 @@ async function onboardingModal(startStep = 0) {
         ${status.capture.panel_built
           ? `<div class="ob-check on">✓ Floating recording panel built</div>`
           : `<div class="ob-check">○ Floating panel (optional always-on-top timer) comes from the same build command</div>`}
-        <div class="t-meta" style="margin:12px 0 4px"><b>macOS permissions</b> — grant the terminal app running <code>npm run dev</code> both <b>Microphone</b> and <b>Screen Recording</b> in System Settings → Privacy &amp; Security. macOS asks on the first capture; a silent, empty recording means a permission is missing.</div>
+        <div class="t-meta" style="margin:12px 0 4px"><b>macOS permissions</b> — grant the terminal app running <code>npm run dev</code> <b>Microphone</b> plus <b>System Audio Recording Only</b> (macOS 14.2+) in System Settings → Privacy &amp; Security. Without System Audio Recording, Threadline falls back to <b>Screen Recording</b>. macOS asks on the first capture; a silent, empty recording means a permission is missing.</div>
         <div class="t-meta" style="margin-top:8px">No restart needed — the binaries are checked each time you hit ● Record.</div>
         ${status.capture.recorder_built ? "" : `<button class="copybtn" id="ob-recheck" style="margin-top:8px">Re-check</button>`}`,
       wire: () => {
