@@ -7,10 +7,12 @@
 //   --dump [bundle-prefix]   print the meeting app's accessibility tree once,
 //                            for calibrating the speaking rules on a real call
 //
-// The speaking rule is generic: an element labelled like "Sharon, speaking" or
-// "Active speaker: Sharon". Matching nothing means no hints — never a guess.
-// Chrome only exposes a page's tree with AXEnhancedUserInterface on, so that
-// is set for windows whose title shows a Meet call, and nothing else.
+// Zoom/Teams: an element labelled like "Sharon, speaking" or "Active speaker:
+// Sharon". Meet labels no one as speaking; it moves a class onto the active
+// speaker's tile instead (see meetActiveSpeaker). Matching nothing means no
+// hints — never a guess. Chrome only exposes a page's tree with
+// AXEnhancedUserInterface on, so that is set for windows whose title shows a
+// Meet call, and nothing else.
 // Needs Accessibility permission for the app running npm run dev.
 //
 // Build:  swiftc -O capture/ThreadlineSpeakers.swift -o capture/threadline-speakers
@@ -81,7 +83,92 @@ func speakingName(_ label: String) -> String? {
     return nil
 }
 
+// ── Meet: the active-speaker class on one participant tile ────────────────
+// Calibrated on a real call (2026-10-23, 4 Hz samples of each tile against
+// the owner's mic): exactly one tile carries "v5h6Xc" at every moment and it
+// moves to whoever speaks. Meet's class names are build artefacts that change
+// between releases, so when the known class vanishes the marker is
+// rediscovered: the class that sits on exactly one tile nearly every sample
+// and has moved between at least two tiles. The owner's own tile counts too;
+// the server drops hints in the owner's name, since that voice is the mic.
+let KNOWN_MEET_MARKERS: Set<String> = ["v5h6Xc"]
+let TILE_DEPTH = 7          // name text → tile root, measured on Meet's tree
+let MARKER_WINDOW = 60      // samples (one a second) used to rediscover the marker
+
+struct Tile { let name: String; let classes: Set<String> }
+var tileHistory: [[Tile]] = []
+
+func domClasses(_ el: AXUIElement) -> [String] { (attr(el, "AXDOMClassList") as? [String]) ?? [] }
+
+/// A tile's display name: "Rachita Mahajan (Presenting)" → "Rachita Mahajan".
+func tileName(_ text: String) -> String? {
+    let name = text.replacingOccurrences(of: #"\s*\(.*\)\s*$"#, with: "", options: .regularExpression)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard (2...60).contains(name.count), name.rangeOfCharacter(from: .letters) != nil,
+          name.range(of: #"^\d{1,2}:\d{2}$|says in chat|^(AM|PM)$"#, options: .regularExpression) == nil
+    else { return nil }
+    return name
+}
+
+/// Each participant tile: the subtree TILE_DEPTH levels above a text node that
+/// holds exactly one candidate name, with every DOM class inside it.
+func meetTiles(_ window: AXUIElement) -> [Tile] {
+    var groups: [(root: AXUIElement, names: [String])] = []
+    walk(window) { el, _ in
+        guard text(el, kAXRoleAttribute) == "AXStaticText", let v = text(el, kAXValueAttribute), let name = tileName(v)
+        else { return true }
+        var root = el
+        for _ in 0..<TILE_DEPTH { if let p = attr(root, kAXParentAttribute) { root = p as! AXUIElement } }
+        if let i = groups.firstIndex(where: { CFEqual($0.root, root) }) { groups[i].names.append(name) }
+        else { groups.append((root, [name])) }
+        return true
+    }
+    return groups.filter { $0.names.count == 1 }.map { g in
+        var classes = Set<String>()
+        var stack = [g.root]
+        var n = 0
+        while let x = stack.popLast(), n < 300 {
+            n += 1
+            classes.formUnion(domClasses(x))
+            stack.append(contentsOf: children(x))
+        }
+        return Tile(name: g.names[0], classes: classes)
+    }
+}
+
+/// The class marking the active speaker in recent history, known one first.
+func activeMarker() -> String? {
+    let recent = tileHistory.suffix(MARKER_WINDOW)
+    if recent.contains(where: { $0.contains { !$0.classes.isDisjoint(with: KNOWN_MEET_MARKERS) } }) {
+        return KNOWN_MEET_MARKERS.first { k in recent.contains { $0.contains { $0.classes.contains(k) } } }
+    }
+    guard recent.count >= 20 else { return nil }
+    var exclusive: [String: Int] = [:], holders: [String: Set<String>] = [:]
+    for sample in recent {
+        var on: [String: [String]] = [:]
+        for t in sample { for c in t.classes { on[c, default: []].append(t.name) } }
+        for (c, names) in on where names.count == 1 {
+            exclusive[c, default: 0] += 1
+            holders[c, default: []].insert(names[0])
+        }
+    }
+    return exclusive
+        .filter { Double($0.value) >= 0.9 * Double(recent.count) && (holders[$0.key]?.count ?? 0) >= 2 }
+        .max { $0.value < $1.value }?.key
+}
+
+func meetActiveSpeaker(_ windows: [AXUIElement]) -> String? {
+    let tiles = windows.flatMap(meetTiles)
+    guard tiles.count >= 2 else { return nil }
+    tileHistory.append(tiles)
+    if tileHistory.count > MARKER_WINDOW { tileHistory.removeFirst() }
+    guard let marker = activeMarker() else { return nil }
+    let holding = tiles.filter { $0.classes.contains(marker) }
+    return holding.count == 1 ? holding[0].name : nil
+}
+
 func currentSpeaker(_ app: AXUIElement, chromium: Bool) -> String? {
+    if chromium { return meetActiveSpeaker(callWindows(app, chromium: true)) }
     var found: String?
     for w in callWindows(app, chromium: chromium) {
         walk(w) { el, _ in
