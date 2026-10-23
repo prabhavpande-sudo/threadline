@@ -68,23 +68,60 @@ final class Downsampler {
 // ── Microphone (channel 1) ────────────────────────────────────────────────
 let engine = AVAudioEngine()
 let micDown = Downsampler()
+let micQueue = DispatchQueue(label: "mic")
+var lastMicBuffer = Date()
 
-func startMic() {
+/// (Re)install the tap with the input's current format and start the engine.
+func runMic() -> Bool {
     let input = engine.inputNode
     // NOTE: do not enable setVoiceProcessingEnabled here — on macOS it can
     // silence the input entirely (observed: all-zero samples). Echo between
     // speakers and mic is handled by the server-side echo gate instead.
+    engine.stop()
+    input.removeTap(onBus: 0)
     let fmt = input.outputFormat(forBus: 0)
+    guard fmt.sampleRate > 0 else { return false }
     input.installTap(onBus: 0, bufferSize: 2048, format: fmt) { buf, _ in
+        lastMicBuffer = Date()
         emit(1, micDown.convert(buf))
     }
     do {
         try engine.start()
+        lastMicBuffer = Date()
         status("mic capturing at \(Int(fmt.sampleRate))Hz")
+        return true
     } catch {
-        status("mic failed: \(error.localizedDescription) — continuing with system audio only")
+        status("mic failed: \(error.localizedDescription)")
+        return false
     }
 }
+
+func startMic() {
+    // Joining a call reconfigures the input (Chrome/Meet opens it with voice
+    // processing; headsets switch devices) and macOS stops this engine for
+    // good. Restart on the change notice, and on a stall as a backstop: the
+    // tap delivers buffers continuously, silence included, so 3s without one
+    // means the mic stopped.
+    NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil) { _ in
+        micQueue.asyncAfter(deadline: .now() + 0.3) {
+            status("mic configuration changed — restarting the mic")
+            _ = runMic()
+        }
+    }
+    micQueue.async {
+        if !runMic() { status("continuing with system audio only until the mic recovers") }
+    }
+    let watchdog = DispatchSource.makeTimerSource(queue: micQueue)
+    watchdog.schedule(deadline: .now() + 3, repeating: 2)
+    watchdog.setEventHandler {
+        guard Date().timeIntervalSince(lastMicBuffer) > 3 else { return }
+        status("mic stalled — restarting the mic")
+        _ = runMic()
+    }
+    watchdog.resume()
+    micWatchdog = watchdog
+}
+var micWatchdog: DispatchSourceTimer?
 
 // ── System audio (channel 0) ──────────────────────────────────────────────
 final class SystemAudio: NSObject, SCStreamOutput, SCStreamDelegate {
