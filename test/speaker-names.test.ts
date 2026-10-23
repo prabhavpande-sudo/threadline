@@ -43,6 +43,17 @@ test("a name goes to one voice only — the one with the strongest evidence", ()
   assert.deepEqual(speakers("sn3"), ["Sharon", "Speaker 2"]);
 });
 
+test("hints in the owner's own name never name a call voice", () => {
+  db.prepare("INSERT INTO meta (key, value) VALUES ('profile', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+    .run(JSON.stringify({ first_name: "Prabhav", last_name: "Pande" }));
+  // The owner backchannels over Speaker 1's turn, so Meet marks the owner's tile.
+  meeting("sn5", [["Speaker 1", 0, 20]],
+    [[1, "Prabhav Pande"], [3, "Prabhav Pande"], [5, "Prabhav Pande"], [7, "Prabhav Pande"], [12, "Deepan"], [14, "Deepan"], [16, "Deepan"]]);
+  const named = nameSpeakersFromHints(db, "sn5");
+  assert.deepEqual(named.map((n) => [n.from, n.to]), [["Speaker 1", "Deepan"]]);
+  db.prepare("DELETE FROM meta WHERE key = 'profile'").run();
+});
+
 test("room voices and hints that fall between turns are ignored", () => {
   meeting("sn4", [["Room 1", 0, 10], ["Speaker 1", 30, 5]],
     [[1, "Sharon"], [3, "Sharon"], [5, "Sharon"], [20, "Raj"], [21, "Raj"], [22, "Raj"]]);
