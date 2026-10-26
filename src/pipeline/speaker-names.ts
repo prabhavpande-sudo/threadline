@@ -16,10 +16,33 @@ const SLACK_S = 0.5; // hint sampling and ASR turn edges don't line up exactly
 
 export type SpeakerNaming = { from: string; to: string; votes: number; share: number };
 
+/**
+ * The owner's own tile lights up too, but the owner's voice is the mic
+ * channel, never a call voice — and with speakers instead of headphones Meet
+ * keeps marking the owner while others talk. Those hints would name a call
+ * voice after the owner, so they're dropped. The owner is the profile's
+ * name, plus THREADLINE_OWNER_NAME (comma-separated) for when the meeting
+ * app shows a different one.
+ */
+function ownerNames(db: DatabaseSync): Set<string> {
+  const names = (process.env.THREADLINE_OWNER_NAME ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const row = db.prepare("SELECT value FROM meta WHERE key = 'profile'").get() as { value: string } | undefined;
+  try {
+    const p = JSON.parse(row?.value ?? "{}") as { first_name?: string; last_name?: string };
+    const first = p.first_name?.trim().toLowerCase();
+    const full = [p.first_name, p.last_name].map((s) => s?.trim()).filter(Boolean).join(" ").toLowerCase();
+    if (first) names.push(first);
+    if (full) names.push(full);
+  } catch { /* no usable profile — the env names still apply */ }
+  return new Set(names);
+}
+
 export function nameSpeakersFromHints(db: DatabaseSync, meetingId: string): SpeakerNaming[] {
-  const hints = db
+  const owner = ownerNames(db);
+  const hints = (db
     .prepare("SELECT offset_s, name FROM speaker_hints WHERE meeting_id = ? ORDER BY offset_s")
-    .all(meetingId) as { offset_s: number; name: string }[];
+    .all(meetingId) as { offset_s: number; name: string }[])
+    .filter((h) => !owner.has(h.name.trim().toLowerCase()));
   if (!hints.length) return [];
   const turns = db
     .prepare("SELECT speaker, offset_s, duration_s FROM utterances WHERE meeting_id = ? AND speaker LIKE 'Speaker %' ORDER BY offset_s")
