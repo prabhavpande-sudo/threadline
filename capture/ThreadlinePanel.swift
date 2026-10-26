@@ -34,8 +34,9 @@ let STOP_URL = URL(string: "http://127.0.0.1:4640/api/record/stop")!
 let START_URL = URL(string: "http://127.0.0.1:4640/api/record/start")!
 let UPCOMING_URL = URL(string: "http://127.0.0.1:4640/api/upcoming")!
 
+let clock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f }()
 func status(_ s: String) {
-    FileHandle.standardError.write(("[panel] " + s + "\n").data(using: .utf8)!)
+    FileHandle.standardError.write(("[panel] \(clock.string(from: Date())) " + s + "\n").data(using: .utf8)!)
 }
 
 /// Same narration as the Shortcuts script: acting on the panel always answers
@@ -312,13 +313,14 @@ func startRecording(title: String?, source: String) {
     }.resume()
 }
 
-/// "Mic in use · Zoom" after a meeting app holds the mic for two polls.
+/// "Mic in use · Zoom" after a meeting app holds the mic for two polls. The
+/// take is named after the calendar event on now, if there is one.
 final class MicOffer {
     private var candidate: String?    // app seen on the last poll, not yet confirmed
     private var dismissedApp: String? // × pressed; quiet until it leaves the mic
     private var wasRecording = false
 
-    func offer(recording: Bool, micApp: String?) -> Offer? {
+    func offer(recording: Bool, micApp: String?, title: String?) -> Offer? {
         if recording {
             wasRecording = true
             candidate = nil
@@ -339,7 +341,7 @@ final class MicOffer {
             return nil
         }
         return Offer(key: "mic:\(app)", text: "Mic in use · \(app)", action: "● Record",
-                     onAccept: { startRecording(title: nil, source: "mic offer") },
+                     onAccept: { startRecording(title: title, source: "mic offer") },
                      onDismiss: { [weak self] in self?.dismissedApp = app })
     }
 }
@@ -361,6 +363,12 @@ final class CalendarOffer {
 
     private func live(_ now: Double) -> [UpcomingEvent] {
         events.filter { now >= $0.atMs - leadMs && now <= $0.atMs + 300_000 && ($0.endMs == 0 || now < $0.endMs) }
+    }
+
+    /// The event on now, for naming a take started some other way — joining
+    /// late counts too, so this runs to the event's end, not the offer window.
+    func liveTitle(_ now: Double) -> String? {
+        events.first { now >= $0.atMs - leadMs && now < ($0.endMs > 0 ? $0.endMs : $0.atMs + 300_000) }?.title
     }
 
     /// A live event the user waved off: its call shouldn't trigger the mic offer either.
@@ -391,11 +399,18 @@ final class CalendarOffer {
 /// Ends a take once the meeting app that held the mic during it lets go:
 /// 10s of grace, then a 15s countdown in the panel with Keep. Takes where no
 /// meeting app ever held the mic (an in-person room) never auto-stop.
+/// It arms only once the app has held the mic for a minute of the take: Meet's
+/// pre-join screen opens the mic, the offer comes up, and Chrome can let go
+/// while joining — a take recorded on 2026-10-26 was ended there, before the
+/// call, and discarded as too short.
 final class AutoStop {
     enum Step { case idle, countdown(app: String, seconds: Int), stop(String) }
     private var app: String?        // meeting app seen on the mic this take
     private var absentSince: Double?
+    private var heldMs = 0.0        // how long it has held the mic this take
+    private var lastHeld: Double?
     private var kept = false
+    private let armMs = 60_000.0
     private let graceMs = 10_000.0
     private let countdownMs = 15_000.0
 
@@ -403,15 +418,20 @@ final class AutoStop {
         guard recording else {
             app = nil
             absentSince = nil
+            heldMs = 0
+            lastHeld = nil
             kept = false
             return .idle
         }
         if let m = micApp {
+            if let l = lastHeld { heldMs += now - l }
+            lastHeld = now
             app = m
             absentSince = nil
             return .idle
         }
-        guard let left = app, !kept else { return .idle }
+        lastHeld = nil
+        guard let left = app, !kept, heldMs >= armMs else { return .idle }
         let since = absentSince ?? now
         absentSince = since
         let remaining = graceMs + countdownMs - (now - since)
@@ -582,7 +602,7 @@ Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
             // Both state machines advance every poll; calendar wins the corner.
             let now = Date().timeIntervalSince1970 * 1000
             let cal = calendarOffer.offer(recording: recording, now: now)
-            let mic = micOffer.offer(recording: recording, micApp: micApp)
+            let mic = micOffer.offer(recording: recording, micApp: micApp, title: calendarOffer.liveTitle(now))
             // Only offer when the server answered: an unreachable server can't record.
             guard serverUp, !startInFlight else { return offerPanel.show(nil) }
             offerPanel.show(cal ?? (calendarOffer.dismissedLive(now) ? nil : mic))
