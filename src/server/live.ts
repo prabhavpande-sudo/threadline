@@ -28,6 +28,15 @@ export type LiveEvent =
 const SPEAKER: Record<number, "Them" | "You"> = { 0: "Them", 1: "You" };
 const ROLE: Record<string, "agent" | "customer"> = { You: "agent", Them: "customer" };
 
+const CALL_RMS = 100; // PCM16 RMS; a pre-join screen measured 0, a live call hundreds+
+
+function rms16(pcm: Buffer): number {
+  let sum = 0;
+  const n = pcm.length >> 1;
+  for (let i = 0; i < n; i++) { const v = pcm.readInt16LE(i * 2); sum += v * v; }
+  return n ? Math.sqrt(sum / n) : 0;
+}
+
 export class LiveSession {
   private helper: ChildProcess | null = null;
   /** Reads the meeting app's "who's speaking" cue; its samples name diarized voices. */
@@ -37,6 +46,12 @@ export class LiveSession {
   /** Audio always lands on disk too, so a PyAI outage never loses a meeting. */
   private tapes: (WriteStream | null)[] = [null, null];
   private audioBytes = [0, 0];
+  /**
+   * Whether the call side (system audio) has carried sound yet. Until it has,
+   * you aren't in a call — a pre-join screen is digital silence — so the panel
+   * won't auto-stop the take. Exposed via /api/record/state.
+   */
+  heardCall = false;
   private lastStreamError: string | null = null;
   private listeners = new Set<(e: LiveEvent) => void>();
   private finals: Utterance[] = [];
@@ -121,6 +136,7 @@ export class LiveSession {
         buf = buf.subarray(5 + len);
         this.tapes[channel]?.write(pcm);
         this.audioBytes[channel] += pcm.length;
+        if (channel === 0 && !this.heardCall && rms16(pcm) > CALL_RMS) this.heardCall = true;
         const ws = this.sockets[channel];
         if (ws?.readyState === WebSocket.OPEN) ws.send(pcm);
       }

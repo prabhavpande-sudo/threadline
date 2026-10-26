@@ -511,7 +511,7 @@ const api: Record<string, Handler> = {
   },
 
   "GET /api/record/state"() {
-    return { recording: !!live, meetingId: live?.meetingId ?? null, title: live?.title ?? null, startedAt: live?.startedAt ?? null };
+    return { recording: !!live, meetingId: live?.meetingId ?? null, title: live?.title ?? null, startedAt: live?.startedAt ?? null, heardCall: live?.heardCall ?? false };
   },
 
   // The MCP setup page needs this machine's absolute server path + tool list.

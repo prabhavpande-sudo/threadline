@@ -399,10 +399,12 @@ final class CalendarOffer {
 /// Ends a take once the meeting app that held the mic during it lets go:
 /// 10s of grace, then a 15s countdown in the panel with Keep. Takes where no
 /// meeting app ever held the mic (an in-person room) never auto-stop.
-/// It arms only once the app has held the mic for a minute of the take: Meet's
-/// pre-join screen opens the mic, the offer comes up, and Chrome can let go
-/// while joining — a take recorded on 2026-10-26 was ended there, before the
-/// call, and discarded as too short.
+/// It arms only once the call has been heard (the server reports sound on the
+/// system-audio channel) and the app has held the mic for a minute of the
+/// take: Meet's pre-join screen opens the mic, the offer comes up, and Chrome
+/// can let go while joining — a take on 2026-10-26 was ended there, in
+/// silence before the call, and discarded as too short. A take you started
+/// stays yours until the call has actually happened.
 final class AutoStop {
     enum Step { case idle, countdown(app: String, seconds: Int), stop(String) }
     private var app: String?        // meeting app seen on the mic this take
@@ -414,7 +416,7 @@ final class AutoStop {
     private let graceMs = 10_000.0
     private let countdownMs = 15_000.0
 
-    func step(recording: Bool, micApp: String?, now: Double) -> Step {
+    func step(recording: Bool, heardCall: Bool, micApp: String?, now: Double) -> Step {
         guard recording else {
             app = nil
             absentSince = nil
@@ -431,7 +433,7 @@ final class AutoStop {
             return .idle
         }
         lastHeld = nil
-        guard let left = app, !kept, heldMs >= armMs else { return .idle }
+        guard let left = app, !kept, heardCall, heldMs >= armMs else { return .idle }
         let since = absentSince ?? now
         absentSince = since
         let remaining = graceMs + countdownMs - (now - since)
@@ -579,11 +581,13 @@ Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
         var recording = false
         var title: String? = nil
         var startedAt: Double? = nil
+        var heardCall = false
         if let data = data,
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             recording = obj["recording"] as? Bool ?? false
             title = obj["title"] as? String
             startedAt = obj["startedAt"] as? Double
+            heardCall = obj["heardCall"] as? Bool ?? false
         }
         let serverUp = data != nil
         // Idle: who might want recording. Recording: whether the call is still on.
@@ -591,7 +595,7 @@ Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
         let micApp = wantMic ? meetingAppOnMic() : nil
         DispatchQueue.main.async {
             controller.apply(recording: recording, title: title, startedAt: startedAt)
-            switch autoStop.step(recording: recording, micApp: micApp, now: Date().timeIntervalSince1970 * 1000) {
+            switch autoStop.step(recording: recording, heardCall: heardCall, micApp: micApp, now: Date().timeIntervalSince1970 * 1000) {
             case .idle: controller.showCountdown(nil)
             case .countdown(let app, let seconds):
                 controller.showCountdown("Stopping in \(seconds)s", reason: "\(app) left the mic")
