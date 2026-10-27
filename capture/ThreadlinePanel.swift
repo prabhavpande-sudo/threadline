@@ -34,6 +34,7 @@ let PORT = ProcessInfo.processInfo.environment["THREADLINE_PORT"] ?? "4640"
 let STATE_URL = URL(string: "http://127.0.0.1:\(PORT)/api/record/state")!
 let STOP_URL = URL(string: "http://127.0.0.1:\(PORT)/api/record/stop")!
 let START_URL = URL(string: "http://127.0.0.1:\(PORT)/api/record/start")!
+let CAPTIONS_URL = URL(string: "http://127.0.0.1:\(PORT)/api/record/captions")!
 let UPCOMING_URL = URL(string: "http://127.0.0.1:\(PORT)/api/upcoming")!
 
 let clock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f }()
@@ -128,10 +129,89 @@ final class LevelBar: NSView {
     }
 }
 
+/// Live captions beside the pill: the last few lines of the live transcript,
+/// newest at the bottom, with the line still being spoken dimmed. A long row
+/// loses its first words, not its last, so the latest words stay visible.
+final class CaptionsPanel {
+    let panel: FloatingPanel
+    private var rows: [NSTextField] = []
+    static let size = NSSize(width: 380, height: 88)
+
+    init() {
+        let size = CaptionsPanel.size
+        panel = FloatingPanel(contentRect: NSRect(origin: .zero, size: size),
+                              styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+        panel.isFloatingPanel = true
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        panel.hidesOnDeactivate = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.sharingType = .none
+        panel.ignoresMouseEvents = true
+        let bg = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        bg.appearance = NSAppearance(named: .darkAqua)
+        bg.material = .hudWindow
+        bg.state = .active
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 14
+        bg.layer?.masksToBounds = true
+        panel.contentView = bg
+        for i in 0..<3 {
+            let row = NSTextField(labelWithString: "")
+            row.frame = NSRect(x: 14, y: size.height - 32 - CGFloat(i) * 22, width: size.width - 28, height: 18)
+            row.lineBreakMode = .byTruncatingHead
+            row.font = .systemFont(ofSize: 12.5)
+            bg.addSubview(row)
+            rows.append(row)
+        }
+    }
+
+    /// Beside the pill, on the side away from the screen edge it hugs.
+    func place(beside pill: NSRect) {
+        let size = CaptionsPanel.size
+        let onRight = NSScreen.screens.first { $0.frame.intersects(pill) }.map { pill.midX > $0.frame.midX } ?? true
+        let x = onRight ? pill.minX - size.width - 8 : pill.maxX + 8
+        panel.setFrame(NSRect(x: x, y: pill.midY - size.height / 2, width: size.width, height: size.height), display: true)
+    }
+
+    func show(_ lines: [(speaker: String, text: String, partial: Bool)], live: Bool) {
+        let shown: [(speaker: String, text: String, partial: Bool)] = lines.isEmpty
+            ? [("", live ? "Listening for speech…" : "No live captions in on-device mode — the transcript comes after the call", true)]
+            : lines
+        for (i, row) in rows.enumerated() {
+            let k = i - (rows.count - shown.count)  // bottom-align: newest last
+            guard k >= 0 else { row.attributedStringValue = NSAttributedString(); continue }
+            let line = shown[k]
+            let color: NSColor = line.partial ? .secondaryLabelColor : .labelColor
+            let text = NSMutableAttributedString()
+            if !line.speaker.isEmpty {
+                text.append(NSAttributedString(string: line.speaker + "  ", attributes: [
+                    .font: NSFont.systemFont(ofSize: 12.5, weight: .semibold),
+                    .foregroundColor: line.speaker == "You"
+                        ? NSColor(red: 0.98, green: 0.45, blue: 0.40, alpha: 1) : NSColor(white: 0.92, alpha: 1)]))
+            }
+            // Drop leading words until the row fits, keeping the speaker label.
+            let body: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 12.5), .foregroundColor: color]
+            var words = line.text.split(separator: " ")
+            var clipped = false
+            func fitted() -> NSAttributedString {
+                let t = NSMutableAttributedString(attributedString: text)
+                t.append(NSAttributedString(string: (clipped ? "…" : "") + words.joined(separator: " "), attributes: body))
+                return t
+            }
+            while words.count > 1 && fitted().size().width > row.frame.width - 4 { words.removeFirst(); clipped = true }
+            row.attributedStringValue = fitted()
+        }
+    }
+}
+
 /// The recording indicator, after Granola's "nub": a narrow pill docked on the
 /// right edge, vertically centred, rather than a box in the corner. It shows a
 /// pulsing dot, one level bar per channel (call, you) so a dead channel is
-/// visible mid-meeting, and the elapsed time. It is left out of screen shares,
+/// visible mid-meeting, the elapsed time, and a CC button for live captions
+/// beside it (remembered between takes). It is left out of screen shares,
 /// can be dragged anywhere, and can be hidden for the rest of a take. During
 /// an auto-stop countdown it widens to show the countdown and Keep.
 final class PanelController: NSObject {
@@ -143,6 +223,9 @@ final class PanelController: NSObject {
     private let timeLabel = NSTextField(labelWithString: "00:00")
     private let countdownLabel = NSTextField(labelWithString: "")
     private let keepButton = NSButton(title: "Keep", target: nil, action: nil)
+    private let ccButton = NSButton(title: "CC", target: nil, action: nil)
+    private let captions = CaptionsPanel()
+    private var captionsOn = UserDefaults.standard.bool(forKey: "captionsOn")
     private var startedAtMs: Double = 0
     private var stopping = false
     private var ticker: Timer?
@@ -154,7 +237,7 @@ final class PanelController: NSObject {
     /// Called when Keep is pressed during an auto-stop countdown.
     var onKeep: (() -> Void)?
 
-    private static let pillSize = NSSize(width: 44, height: 124)
+    private static let pillSize = NSSize(width: 44, height: 148)
     private static let expandedWidth: CGFloat = 216
     private static let originKey = "pillOrigin"
 
@@ -166,8 +249,8 @@ final class PanelController: NSObject {
             backing: .buffered, defer: true
         )
         pill = PillView(frame: NSRect(origin: .zero, size: size))
-        callBar = LevelBar(frame: NSRect(x: 13, y: 38, width: 6, height: 46), color: NSColor(white: 0.92, alpha: 1))
-        micBar = LevelBar(frame: NSRect(x: 25, y: 38, width: 6, height: 46),
+        callBar = LevelBar(frame: NSRect(x: 13, y: 62, width: 6, height: 46), color: NSColor(white: 0.92, alpha: 1))
+        micBar = LevelBar(frame: NSRect(x: 25, y: 62, width: 6, height: 46),
                           color: NSColor(red: 0.98, green: 0.45, blue: 0.40, alpha: 1))
         super.init()
 
@@ -216,7 +299,13 @@ final class PanelController: NSObject {
         keepButton.bezelStyle = .rounded
         keepButton.toolTip = "Keep recording"
 
-        [dot, callBar, micBar, timeLabel, countdownLabel, keepButton].forEach { pill.addSubview($0) }
+        ccButton.target = self
+        ccButton.action = #selector(ccTapped)
+        ccButton.isBordered = false
+        ccButton.toolTip = "Live captions"
+        updateCC()
+
+        [dot, callBar, micBar, timeLabel, countdownLabel, keepButton, ccButton].forEach { pill.addSubview($0) }
         layout()
     }
 
@@ -231,7 +320,9 @@ final class PanelController: NSObject {
         dot.frame = NSRect(x: col + 17, y: h - 24, width: 10, height: 10)
         callBar.frame.origin.x = col + 13
         micBar.frame.origin.x = col + 25
-        timeLabel.frame = NSRect(x: col, y: 12, width: 44, height: 16)
+        timeLabel.frame = NSRect(x: col, y: 38, width: 44, height: 16)
+        ccButton.frame = NSRect(x: col + 7, y: 10, width: 30, height: 20)
+        if captionsOn && panel.isVisible { captions.place(beside: panel.frame) }
         let text: CGFloat = expanded && onRight ? 12 : 52
         countdownLabel.frame = NSRect(x: text, y: h / 2 + 4, width: w - 44 - 20, height: 18)
         keepButton.frame = NSRect(x: text - 4, y: h / 2 - 32, width: 72, height: 30)
@@ -258,12 +349,31 @@ final class PanelController: NSObject {
         m.addItem(head)
         m.addItem(.separator())
         [("Open Threadline", #selector(openTapped)), ("Stop recording", #selector(stopTapped)),
+         (captionsOn ? "Hide live captions" : "Show live captions", #selector(ccTapped)),
          ("Hide until this recording ends", #selector(hideTapped))].forEach { (t, a) in
             let item = NSMenuItem(title: t, action: a, keyEquivalent: "")
             item.target = self
             m.addItem(item)
         }
         return m
+    }
+
+    private func updateCC() {
+        ccButton.attributedTitle = NSAttributedString(string: "CC", attributes: [
+            .font: NSFont.systemFont(ofSize: 10, weight: .bold),
+            .foregroundColor: captionsOn ? NSColor.white : NSColor.white.withAlphaComponent(0.4)])
+    }
+
+    @objc private func ccTapped() {
+        captionsOn.toggle()
+        UserDefaults.standard.set(captionsOn, forKey: "captionsOn")
+        updateCC()
+        if captionsOn && panel.isVisible {
+            captions.place(beside: panel.frame)
+            captions.panel.orderFrontRegardless()
+        } else {
+            captions.panel.orderOut(nil)
+        }
     }
 
     @objc private func openTapped() { NSWorkspace.shared.open(URL(string: "http://localhost:\(PORT)/")!) }
@@ -305,6 +415,11 @@ final class PanelController: NSObject {
                 layout()
                 tickTime()
                 panel.orderFrontRegardless()
+                if captionsOn {
+                    captions.show([], live: true)
+                    captions.place(beside: panel.frame)
+                    captions.panel.orderFrontRegardless()
+                }
                 ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tickTime() }
                 levelPoll = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in self?.pollLevels() }
                 status("recording live — panel shown")
@@ -320,6 +435,7 @@ final class PanelController: NSObject {
         showCountdown(nil)
         guard panel.isVisible else { return }
         panel.orderOut(nil)
+        captions.panel.orderOut(nil)
         ticker?.invalidate()
         ticker = nil
         levelPoll?.invalidate()
@@ -335,6 +451,14 @@ final class PanelController: NSObject {
                 self?.callBar.set(levels[0])
                 self?.micBar.set(levels[1])
             }
+        }.resume()
+        guard captionsOn else { return }
+        URLSession.shared.dataTask(with: CAPTIONS_URL) { [weak self] data, _, _ in
+            guard let data = data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let raw = obj["lines"] as? [[String: Any]] else { return }
+            let lines = raw.map { (speaker: $0["speaker"] as? String ?? "", text: $0["text"] as? String ?? "", partial: $0["partial"] as? Bool ?? false) }
+            let live = obj["live"] as? Bool ?? true
+            DispatchQueue.main.async { self?.captions.show(lines, live: live) }
         }.resume()
     }
 
