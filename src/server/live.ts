@@ -52,6 +52,8 @@ export class LiveSession {
    * won't auto-stop the take. Exposed via /api/record/state.
    */
   heardCall = false;
+  /** Latest loudness per channel (0–1: call, mic), for the panel's level bars. */
+  levels = [0, 0];
   private lastStreamError: string | null = null;
   private listeners = new Set<(e: LiveEvent) => void>();
   private finals: Utterance[] = [];
@@ -136,7 +138,10 @@ export class LiveSession {
         buf = buf.subarray(5 + len);
         this.tapes[channel]?.write(pcm);
         this.audioBytes[channel] += pcm.length;
-        if (channel === 0 && !this.heardCall && rms16(pcm) > CALL_RMS) this.heardCall = true;
+        const rms = rms16(pcm);
+        if (channel === 0 && !this.heardCall && rms > CALL_RMS) this.heardCall = true;
+        // log scale: room hiss (~60) sits near the floor, speech (1–5k) fills the bar
+        this.levels[channel] = Math.max(0, Math.min(1, Math.log10(Math.max(rms, 1) / 50) / 2));
         const ws = this.sockets[channel];
         if (ws?.readyState === WebSocket.OPEN) ws.send(pcm);
       }

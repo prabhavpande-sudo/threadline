@@ -29,10 +29,12 @@ import Cocoa
 import CoreAudio
 import Foundation
 
-let STATE_URL = URL(string: "http://127.0.0.1:4640/api/record/state")!
-let STOP_URL = URL(string: "http://127.0.0.1:4640/api/record/stop")!
-let START_URL = URL(string: "http://127.0.0.1:4640/api/record/start")!
-let UPCOMING_URL = URL(string: "http://127.0.0.1:4640/api/upcoming")!
+// THREADLINE_PORT points the panel at another server (e.g. a test stub).
+let PORT = ProcessInfo.processInfo.environment["THREADLINE_PORT"] ?? "4640"
+let STATE_URL = URL(string: "http://127.0.0.1:\(PORT)/api/record/state")!
+let STOP_URL = URL(string: "http://127.0.0.1:\(PORT)/api/record/stop")!
+let START_URL = URL(string: "http://127.0.0.1:\(PORT)/api/record/start")!
+let UPCOMING_URL = URL(string: "http://127.0.0.1:\(PORT)/api/upcoming")!
 
 let clock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f }()
 func status(_ s: String) {
@@ -61,49 +63,133 @@ func narrateStop(_ body: String) {
     }
 }
 
-// Borderless panels refuse key status by default; the Stop button wants it.
+// Borderless panels refuse key status by default; the Keep button wants it.
 // .nonactivatingPanel keeps clicks from activating the app or stealing focus.
 final class FloatingPanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
+/// The pill's surface. A click opens Threadline, a drag moves the pill (the
+/// spot is remembered), and a right-click offers Stop and Hide — so a stray
+/// click can't end a recording, the way the old corner box's ■ could.
+final class PillView: NSVisualEffectView {
+    var onClick: (() -> Void)?
+    var onMoved: (() -> Void)?
+    var contextMenu: (() -> NSMenu)?
+    private var grab: NSPoint?
+    private var origin: NSPoint?
+    private var dragged = false
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    /// Labels and bars inside the pill belong to the pill; buttons keep their clicks.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let v = super.hitTest(point) else { return nil }
+        return v is NSButton ? v : self
+    }
+    override func mouseDown(with event: NSEvent) {
+        grab = NSEvent.mouseLocation
+        origin = window?.frame.origin
+        dragged = false
+    }
+    override func mouseDragged(with event: NSEvent) {
+        guard let g = grab, let o = origin, let w = window else { return }
+        let p = NSEvent.mouseLocation
+        let dx = p.x - g.x, dy = p.y - g.y
+        if !dragged && hypot(dx, dy) < 3 { return }
+        dragged = true
+        w.setFrameOrigin(NSPoint(x: o.x + dx, y: o.y + dy))
+    }
+    override func mouseUp(with event: NSEvent) {
+        if dragged { onMoved?() } else { onClick?() }
+        grab = nil
+    }
+    override func rightMouseDown(with event: NSEvent) {
+        if let m = contextMenu?() { NSMenu.popUpContextMenu(m, with: event, for: self) }
+    }
+}
+
+/// A thin vertical bar showing one channel's loudness.
+final class LevelBar: NSView {
+    private let fill = CALayer()
+    init(frame: NSRect, color: NSColor) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        layer?.cornerRadius = frame.width / 2
+        fill.backgroundColor = color.cgColor
+        fill.cornerRadius = frame.width / 2
+        fill.frame = NSRect(x: 0, y: 0, width: frame.width, height: 0)
+        layer?.addSublayer(fill)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    func set(_ level: Double) {
+        let h = max(frame.width, CGFloat(min(1, max(0, level))) * frame.height)
+        fill.frame = NSRect(x: 0, y: 0, width: frame.width, height: h)
+    }
+}
+
+/// The recording indicator, after Granola's "nub": a narrow pill docked on the
+/// right edge, vertically centred, rather than a box in the corner. It shows a
+/// pulsing dot, one level bar per channel (call, you) so a dead channel is
+/// visible mid-meeting, and the elapsed time. It is left out of screen shares,
+/// can be dragged anywhere, and can be hidden for the rest of a take. During
+/// an auto-stop countdown it widens to show the countdown and Keep.
 final class PanelController: NSObject {
     private let panel: FloatingPanel
-    private let titleLabel = NSTextField(labelWithString: "Recording")
+    private let pill: PillView
+    private let dot = NSView(frame: .zero)
+    private let callBar: LevelBar
+    private let micBar: LevelBar
     private let timeLabel = NSTextField(labelWithString: "00:00")
-    private let dot = NSView(frame: NSRect(x: 14, y: 25, width: 10, height: 10))
+    private let countdownLabel = NSTextField(labelWithString: "")
     private let keepButton = NSButton(title: "Keep", target: nil, action: nil)
     private var startedAtMs: Double = 0
     private var stopping = false
     private var ticker: Timer?
+    private var levelPoll: Timer?
     private var title = "Recording"
+    private var meetingId: String?
+    private var hiddenFor: String?  // "Hide" pressed during this take
+    private var expanded = false
     /// Called when Keep is pressed during an auto-stop countdown.
     var onKeep: (() -> Void)?
 
+    private static let pillSize = NSSize(width: 44, height: 124)
+    private static let expandedWidth: CGFloat = 216
+    private static let originKey = "pillOrigin"
+
     override init() {
-        let size = NSSize(width: 292, height: 60)
+        let size = PanelController.pillSize
         panel = FloatingPanel(
             contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: true
         )
+        pill = PillView(frame: NSRect(origin: .zero, size: size))
+        callBar = LevelBar(frame: NSRect(x: 13, y: 38, width: 6, height: 46), color: NSColor(white: 0.92, alpha: 1))
+        micBar = LevelBar(frame: NSRect(x: 25, y: 38, width: 6, height: 46),
+                          color: NSColor(red: 0.98, green: 0.45, blue: 0.40, alpha: 1))
         super.init()
 
         panel.isFloatingPanel = true
         panel.level = .floating
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.hidesOnDeactivate = false
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
+        panel.sharingType = .none  // never shows up in a screen share
 
-        let blur = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
-        blur.material = .hudWindow
-        blur.state = .active
-        blur.wantsLayer = true
-        blur.layer?.cornerRadius = 14
-        blur.layer?.masksToBounds = true
-        panel.contentView = blur
+        pill.appearance = NSAppearance(named: .darkAqua)  // legible on light wallpapers too
+        pill.material = .hudWindow
+        pill.state = .active
+        pill.wantsLayer = true
+        pill.layer?.cornerRadius = 22
+        pill.layer?.masksToBounds = true
+        pill.onClick = { NSWorkspace.shared.open(URL(string: "http://localhost:\(PORT)/")!) }
+        pill.onMoved = { [weak self] in self?.saveOrigin() }
+        pill.contextMenu = { [weak self] in self?.contextMenu() ?? NSMenu() }
+        panel.contentView = pill
 
         dot.wantsLayer = true
         dot.layer?.backgroundColor = NSColor(red: 0.88, green: 0.27, blue: 0.24, alpha: 1).cgColor
@@ -115,56 +201,117 @@ final class PanelController: NSObject {
         pulse.autoreverses = true
         pulse.repeatCount = .infinity
         dot.layer?.add(pulse, forKey: "pulse")
-        blur.addSubview(dot)
+        callBar.toolTip = "Call audio"
+        micBar.toolTip = "Your mic"
 
-        titleLabel.frame = NSRect(x: 32, y: 21, width: 140, height: 18)
-        titleLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
-        titleLabel.lineBreakMode = .byTruncatingTail
-        blur.addSubview(titleLabel)
-
-        timeLabel.frame = NSRect(x: 176, y: 21, width: 52, height: 18)
-        timeLabel.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .regular)
+        timeLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .medium)
         timeLabel.textColor = .secondaryLabelColor
-        blur.addSubview(timeLabel)
+        timeLabel.alignment = .center
 
-        // Shares the timer's slot; only visible during an auto-stop countdown.
+        countdownLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
+        countdownLabel.lineBreakMode = .byTruncatingTail
+
         keepButton.target = self
         keepButton.action = #selector(keepTapped)
-        keepButton.frame = NSRect(x: 172, y: 15, width: 60, height: 30)
         keepButton.bezelStyle = .rounded
         keepButton.toolTip = "Keep recording"
-        keepButton.isHidden = true
-        blur.addSubview(keepButton)
 
-        let stop = NSButton(title: "■", target: self, action: #selector(stopTapped))
-        stop.frame = NSRect(x: 234, y: 15, width: 44, height: 30)
-        stop.bezelStyle = .rounded
-        stop.font = .systemFont(ofSize: 13, weight: .bold)
-        stop.contentTintColor = NSColor(red: 0.88, green: 0.27, blue: 0.24, alpha: 1)
-        stop.toolTip = "Stop recording"
-        blur.addSubview(stop)
+        [dot, callBar, micBar, timeLabel, countdownLabel, keepButton].forEach { pill.addSubview($0) }
+        layout()
+    }
 
-        if let screen = NSScreen.main {
-            let v = screen.visibleFrame
-            panel.setFrameOrigin(NSPoint(x: v.maxX - size.width - 16, y: v.maxY - size.height - 16))
+    /// Pill content sits in a 44pt column on the side facing the screen edge;
+    /// the countdown, when shown, takes the rest.
+    private func layout() {
+        let w = expanded ? PanelController.expandedWidth : PanelController.pillSize.width
+        let h = PanelController.pillSize.height
+        let onRight = (panel.screen ?? NSScreen.main).map { panel.frame.midX > $0.frame.midX } ?? true
+        let col: CGFloat = expanded && onRight ? w - 44 : 0
+        pill.frame = NSRect(x: 0, y: 0, width: w, height: h)
+        dot.frame = NSRect(x: col + 17, y: h - 24, width: 10, height: 10)
+        callBar.frame.origin.x = col + 13
+        micBar.frame.origin.x = col + 25
+        timeLabel.frame = NSRect(x: col, y: 12, width: 44, height: 16)
+        let text: CGFloat = expanded && onRight ? 12 : 52
+        countdownLabel.frame = NSRect(x: text, y: h / 2 + 4, width: w - 44 - 20, height: 18)
+        keepButton.frame = NSRect(x: text - 4, y: h / 2 - 32, width: 72, height: 30)
+        countdownLabel.isHidden = !expanded
+        keepButton.isHidden = !expanded
+    }
+
+    private func setExpanded(_ on: Bool) {
+        guard on != expanded else { return }
+        let f = panel.frame
+        let onRight = (panel.screen ?? NSScreen.main).map { f.midX > $0.frame.midX } ?? true
+        expanded = on
+        let w = on ? PanelController.expandedWidth : PanelController.pillSize.width
+        // Grow away from the edge the pill is docked to.
+        let x = onRight ? f.maxX - w : f.minX
+        panel.setFrame(NSRect(x: x, y: f.minY, width: w, height: f.height), display: true)
+        layout()
+    }
+
+    private func contextMenu() -> NSMenu {
+        let m = NSMenu()
+        let head = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        head.isEnabled = false
+        m.addItem(head)
+        m.addItem(.separator())
+        [("Open Threadline", #selector(openTapped)), ("Stop recording", #selector(stopTapped)),
+         ("Hide until this recording ends", #selector(hideTapped))].forEach { (t, a) in
+            let item = NSMenuItem(title: t, action: a, keyEquivalent: "")
+            item.target = self
+            m.addItem(item)
         }
+        return m
+    }
+
+    @objc private func openTapped() { NSWorkspace.shared.open(URL(string: "http://localhost:\(PORT)/")!) }
+    @objc private func hideTapped() {
+        hiddenFor = meetingId
+        status("panel hidden for this recording")
+        hide()
+    }
+
+    private func saveOrigin() {
+        let o = panel.frame.origin
+        UserDefaults.standard.set([o.x, o.y], forKey: PanelController.originKey)
+        layout()
+    }
+
+    /// The remembered spot if it's still on a screen, else the right edge, centred.
+    private func placePanel() {
+        let size = PanelController.pillSize
+        if let xy = UserDefaults.standard.array(forKey: PanelController.originKey) as? [Double], xy.count == 2 {
+            let r = NSRect(x: xy[0], y: xy[1], width: size.width, height: size.height)
+            if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(r) }) { return panel.setFrame(r, display: false) }
+        }
+        guard let v = NSScreen.main?.visibleFrame else { return }
+        panel.setFrame(NSRect(x: v.maxX - size.width - 8, y: v.midY - size.height / 2, width: size.width, height: size.height), display: false)
     }
 
     /// Called on the main thread with the latest server state.
-    func apply(recording: Bool, title: String?, startedAt: Double?) {
+    func apply(recording: Bool, title: String?, startedAt: Double?, meetingId: String?) {
         if recording && !stopping {
             startedAtMs = startedAt ?? startedAtMs
             self.title = (title?.isEmpty == false ? title! : "Recording")
-            if keepButton.isHidden { titleLabel.stringValue = self.title }
+            self.meetingId = meetingId
+            pill.toolTip = "\(self.title) — click to open, right-click for Stop and Hide"
+            if meetingId != nil && meetingId == hiddenFor { return }
             if !panel.isVisible {
                 if startedAt == nil { startedAtMs = Date().timeIntervalSince1970 * 1000 }
+                expanded = false
+                placePanel()
+                layout()
                 tickTime()
                 panel.orderFrontRegardless()
                 ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tickTime() }
+                levelPoll = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in self?.pollLevels() }
                 status("recording live — panel shown")
             }
         } else if !recording {
             stopping = false
+            hiddenFor = nil
             hide()
         }
     }
@@ -175,27 +322,43 @@ final class PanelController: NSObject {
         panel.orderOut(nil)
         ticker?.invalidate()
         ticker = nil
+        levelPoll?.invalidate()
+        levelPoll = nil
         status("recording ended — panel hidden")
+    }
+
+    private func pollLevels() {
+        URLSession.shared.dataTask(with: STATE_URL) { [weak self] data, _, _ in
+            guard let data = data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let levels = obj["levels"] as? [Double], levels.count == 2 else { return }
+            DispatchQueue.main.async {
+                self?.callBar.set(levels[0])
+                self?.micBar.set(levels[1])
+            }
+        }.resume()
     }
 
     private func tickTime() {
         let secs = max(0, Int((Date().timeIntervalSince1970 * 1000 - startedAtMs) / 1000))
-        timeLabel.stringValue = String(format: "%02d:%02d", secs / 60, secs % 60)
+        timeLabel.stringValue = secs >= 3600
+            ? String(format: "%d:%02d", secs / 3600, secs / 60 % 60)
+            : String(format: "%02d:%02d", secs / 60, secs % 60)
     }
 
-    /// Auto-stop countdown text in place of the title, with Keep in place of
-    /// the timer; nil restores the normal panel.
+    /// Auto-stop countdown beside the pill, with Keep; nil folds it away. A
+    /// countdown shows even when the pill was hidden — it's about to stop.
     func showCountdown(_ text: String?, reason: String = "") {
         if let text = text {
-            if keepButton.isHidden { status("auto-stop countdown: \(reason)") }
-            titleLabel.stringValue = text
-            titleLabel.toolTip = reason
-            timeLabel.isHidden = true
-            keepButton.isHidden = false
-        } else if !keepButton.isHidden {
-            titleLabel.stringValue = title
-            timeLabel.isHidden = false
-            keepButton.isHidden = true
+            if !expanded { status("auto-stop countdown: \(reason)") }
+            if !panel.isVisible && meetingId != nil {
+                hiddenFor = nil
+                apply(recording: true, title: title, startedAt: startedAtMs, meetingId: meetingId)
+            }
+            countdownLabel.stringValue = text
+            countdownLabel.toolTip = reason
+            setExpanded(true)
+        } else if expanded {
+            setExpanded(false)
         }
     }
 
@@ -582,19 +745,21 @@ Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
         var title: String? = nil
         var startedAt: Double? = nil
         var heardCall = false
+        var meetingId: String? = nil
         if let data = data,
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             recording = obj["recording"] as? Bool ?? false
             title = obj["title"] as? String
             startedAt = obj["startedAt"] as? Double
             heardCall = obj["heardCall"] as? Bool ?? false
+            meetingId = obj["meetingId"] as? String
         }
         let serverUp = data != nil
         // Idle: who might want recording. Recording: whether the call is still on.
         let wantMic = serverUp && (recording ? autoStopEnabled : micPromptEnabled)
         let micApp = wantMic ? meetingAppOnMic() : nil
         DispatchQueue.main.async {
-            controller.apply(recording: recording, title: title, startedAt: startedAt)
+            controller.apply(recording: recording, title: title, startedAt: startedAt, meetingId: meetingId)
             switch autoStop.step(recording: recording, heardCall: heardCall, micApp: micApp, now: Date().timeIntervalSince1970 * 1000) {
             case .idle: controller.showCountdown(nil)
             case .countdown(let app, let seconds):
