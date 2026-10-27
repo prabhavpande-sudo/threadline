@@ -47,11 +47,25 @@ export class LiveSession {
   private tapes: (WriteStream | null)[] = [null, null];
   private audioBytes = [0, 0];
   /**
+   * Live captions for the panel: the last few finished lines, then whatever
+   * each side is saying right now. Empty in on-device mode (no live stream).
+   */
+  captions(): { speaker: string; text: string; partial: boolean }[] {
+    const done = this.finals.slice(-3).map((u) => ({ speaker: u.speaker ?? "", text: u.text, partial: false }));
+    const now = (["Them", "You"] as const).filter((s) => this.partials[s]).map((s) => ({ speaker: s, text: this.partials[s], partial: true }));
+    return [...done, ...now].slice(-3);
+  }
+
+  /**
    * Whether the call side (system audio) has carried sound yet. Until it has,
    * you aren't in a call — a pre-join screen is digital silence — so the panel
    * won't auto-stop the take. Exposed via /api/record/state.
    */
   heardCall = false;
+  /** Latest loudness per channel (0–1: call, mic), for the panel's level bars. */
+  levels = [0, 0];
+  /** The line each side is mid-way through, for the panel's live captions. */
+  private partials: Record<"You" | "Them", string> = { You: "", Them: "" };
   private lastStreamError: string | null = null;
   private listeners = new Set<(e: LiveEvent) => void>();
   private finals: Utterance[] = [];
@@ -136,7 +150,10 @@ export class LiveSession {
         buf = buf.subarray(5 + len);
         this.tapes[channel]?.write(pcm);
         this.audioBytes[channel] += pcm.length;
-        if (channel === 0 && !this.heardCall && rms16(pcm) > CALL_RMS) this.heardCall = true;
+        const rms = rms16(pcm);
+        if (channel === 0 && !this.heardCall && rms > CALL_RMS) this.heardCall = true;
+        // log scale: room hiss (~60) sits near the floor, speech (1–5k) fills the bar
+        this.levels[channel] = Math.max(0, Math.min(1, Math.log10(Math.max(rms, 1) / 50) / 2));
         const ws = this.sockets[channel];
         if (ws?.readyState === WebSocket.OPEN) ws.send(pcm);
       }
@@ -186,6 +203,7 @@ export class LiveSession {
           this.themRecent.push({ text: msg.text, at: Date.now() });
           if (this.themRecent.length > 30) this.themRecent.shift();
         } else if (this.isEcho(msg.text)) return;
+        this.partials[speaker] = msg.text;
         this.emit({ type: "partial", speaker, text: msg.text, utteranceId: msg.utterance_id ?? "" });
       } else if (msg.type === "final" && msg.text?.trim()) {
         const offsetS = this.offsetBase + Math.max(0, ((msg.t_ms ?? 0) - (msg.audio_ms ?? 0)) / 1000);
@@ -212,6 +230,7 @@ export class LiveSession {
           }
         }
         this.finals.push({ speaker, speaker_role: ROLE[speaker], text: msg.text, offset_s: offsetS, duration_s: durationS });
+        this.partials[speaker] = "";
         this.emit({ type: "final", speaker, text: msg.text, offsetS, durationS });
       } else if (msg.type === "error") {
         this.lastStreamError = `${speaker} stream: ${JSON.stringify(msg)}`;

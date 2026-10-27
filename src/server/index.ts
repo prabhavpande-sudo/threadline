@@ -510,8 +510,12 @@ const api: Record<string, Handler> = {
     return { markdown, filename: `threadline-${node.kind}-${node.label.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40)}.md` };
   },
 
+  "GET /api/record/captions"() {
+    return { lines: live?.captions() ?? [], live: !!live && !localTranscribeOnly() };
+  },
+
   "GET /api/record/state"() {
-    return { recording: !!live, meetingId: live?.meetingId ?? null, title: live?.title ?? null, startedAt: live?.startedAt ?? null, heardCall: live?.heardCall ?? false };
+    return { recording: !!live, meetingId: live?.meetingId ?? null, title: live?.title ?? null, startedAt: live?.startedAt ?? null, heardCall: live?.heardCall ?? false, levels: live?.levels ?? [0, 0] };
   },
 
   // The MCP setup page needs this machine's absolute server path + tool list.
