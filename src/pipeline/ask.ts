@@ -8,14 +8,13 @@
  * A sentence that cannot cite a retrieved chunk, quote it, and avoid inventing
  * new facts is dropped and recorded — same discipline as extraction claims.
  *
- * Without OPENAI_API_KEY the answer is extractive (top chunks verbatim), which
+ * Without a text model configured the answer is extractive (top chunks verbatim), which
  * trivially passes every gate and keeps the whole feature fully local.
  */
 import type { DatabaseSync } from "node:sqlite";
 import { Budget, retry, groundedIn, applyGate, allOf, decideExit, normalize, type Gate, type StepRecord } from "../lib/harness.js";
 import { because, CodedError } from "../lib/reasons.js";
-import { chatJson } from "../lib/model.js";
-import { hasOpenAI } from "../lib/openai.js";
+import { chatJson, modelConfigured } from "../lib/model.js";
 import { retrieve, type Snippet } from "./retrieve.js";
 
 export type AskPoint = { text: string; chunk_id: number; quote: string; meeting_id: string; meeting_title: string; offset_s: number };
@@ -126,7 +125,7 @@ export async function ask(db: DatabaseSync, question: string, opts: { budget?: B
       receipts, exit: decideExit(steps, budget), steps };
   };
 
-  if (!hasOpenAI() || process.env.THREADLINE_SYNTHESIS === "off") {
+  if (!modelConfigured() || process.env.THREADLINE_SYNTHESIS === "off") {
     // Extractive: top snippets ARE the answer, so the gates pass by construction.
     const points: RawPoint[] = receipts.slice(0, 3).map((s) => ({ text: s.text, chunk_id: s.chunk_id, quote: s.text.slice(0, 80) }));
     steps.push({ name: "synthesize", status: "skipped", attempts: 0, ms: 0, reason: because("skipped-local-only", "local-only — extractive answer") });

@@ -4724,7 +4724,7 @@ function notesCard(data) {
       ${notesHead()}
       <div id="notes-doc" contenteditable="true" data-ph="🧵 Start a thread… or hit Structure my notes"></div>
       ${data.model && !data.model.configured
-        ? `<div class="review-banner"><b>No model configured.</b><span>Add PYAI_API_KEY or OPENAI_API_KEY to .env to have notes write themselves.</span></div>`
+        ? `<div class="review-banner"><b>No model configured.</b><span>Add ANTHROPIC_API_KEY to .env to have notes write themselves.</span></div>`
         : ""}
     </div>`;
   }

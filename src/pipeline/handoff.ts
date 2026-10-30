@@ -204,7 +204,7 @@ export async function ensureNotes(
       if (!m) return { ...bail("not-found", "meeting not found", null), runId };
       if (!m.segments.length) return { ...bail("no-transcript", "no transcript yet", null), runId };
       if (!modelConfigured())
-        return { ...bail("model-unconfigured", "no model configured — set PYAI_API_KEY (or OPENAI_API_KEY)", existing), runId };
+        return { ...bail("model-unconfigured", "no model configured — set ANTHROPIC_API_KEY (or OPENAI_API_KEY)", existing), runId };
 
       // Fail closed. A model that is down, 404ing or out of quota is an
       // OUTCOME, not an exception to throw at the caller: the run is recorded
@@ -300,7 +300,7 @@ export async function runHandoff(
       if (!m) return { ...bail("not-found", "meeting not found"), runId };
       if (!m.segments.length) return { ...bail("no-transcript", "no transcript yet"), runId };
       if (!modelConfigured())
-        return { ...bail("model-unconfigured", "no model configured — set PYAI_API_KEY (or OPENAI_API_KEY)"), runId };
+        return { ...bail("model-unconfigured", "no model configured — set ANTHROPIC_API_KEY (or OPENAI_API_KEY)"), runId };
 
       let statements: StatementSet;
       try {
@@ -378,7 +378,7 @@ export async function runCrossHandoff(
     async (budget, runId): Promise<HandoffResult & { _out?: GroundedOutput<unknown> }> => {
       budgetUsed = budget;
       if (!modelConfigured())
-        return { ...bail("model-unconfigured", "no model configured — set PYAI_API_KEY (or OPENAI_API_KEY)"), runId };
+        return { ...bail("model-unconfigured", "no model configured — set ANTHROPIC_API_KEY (or OPENAI_API_KEY)"), runId };
 
       const ids = args.meetingIds?.length ? args.meetingIds : customerMeetingIds(db);
       if (ids.length < 2) return { ...bail("no-transcript", "collating needs at least two meetings"), runId };

@@ -23,6 +23,7 @@
     "brain-md": "tsx src/cli/brain-md.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.3.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "pdf-parse": "^1.1.1",
     "tsx": "^4.19.0",

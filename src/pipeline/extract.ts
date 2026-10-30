@@ -20,7 +20,7 @@ import { resolveCandidates, storeResolutions, relateEntities } from "./resolve.j
 import { projectGraph } from "./project.js";
 import { indexMeeting } from "./chunker.js";
 import { generateBrainMd } from "./brain-md.js";
-import { hasOpenAI, openaiExtract } from "../lib/openai.js";
+import { openaiExtract } from "../lib/openai.js";
 import { modelConfigured } from "../lib/model.js";
 import { clearStatements } from "../lib/store.js";
 import { ensureNotes } from "./handoff.js";
@@ -148,10 +148,10 @@ async function processMeetingInner(db: DatabaseSync, apiKey: string, m: MeetingI
   );
   steps.push(recap.record);
 
-  // Recap down but OpenAI configured → same extraction, fallback engine.
+  // Recap down but a text model configured → same extraction, fallback engine.
   let record = recap.value?.record ?? null;
   let headline = recap.value?.headline ?? null;
-  if (!record && hasOpenAI()) {
+  if (!record && modelConfigured()) {
     const fb = await retry("fallback:openai-extract", budget, () => {
       budget.spendUnits(1);
       return openaiExtract(m.utterances);
@@ -192,7 +192,7 @@ async function processMeetingInner(db: DatabaseSync, apiKey: string, m: MeetingI
 
     // Second pass: restructure the draft into a validated, grounded document.
     // Non-core — a failure here degrades to the flat summary, never kills the run.
-    if (hasOpenAI()) {
+    if (modelConfigured()) {
       const structured = await structureSummary(budget, m.utterances, rec);
       steps.push(structured.record);
       if (structured.value) {
@@ -242,8 +242,8 @@ async function processMeetingInner(db: DatabaseSync, apiKey: string, m: MeetingI
     reindexMeeting(db, m.id);
 
     // Project matching: suggestions only, the user files. Non-core — skipped
-    // silently without OpenAI or candidate projects, never kills the run.
-    if (hasOpenAI()) {
+    // silently without a text model or candidate projects, never kills the run.
+    if (modelConfigured()) {
       const match = await suggestProjects(db, budget, m, rec);
       if (match) steps.push(match);
     }

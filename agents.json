@@ -7,8 +7,8 @@
     "recap": { "provider": "pyai", "surface": "recap.calls" },
     "extract": { "provider": "anthropic", "model": "claude-sonnet-5" },
     "chat": {
-      "provider": "openai",
-      "model": { "pyai": "pyai-think", "openai": "gpt-4o-mini" },
+      "provider": "anthropic",
+      "model": { "anthropic": "claude-haiku-5-5", "pyai": "pyai-think", "openai": "gpt-4o-mini" },
       "purposes": {
         "statements.extract": { "temperature": 0 },
         "notes": { "temperature": 0.1 },
@@ -16,6 +16,7 @@
       }
     },
     "pricing": {
+      "claude-haiku-5-5": { "in": 0.0001, "out": 0.0005 },
       "pyai-think": { "in": 0.0005, "out": 0.0015 },
       "gpt-4o-mini": { "in": 0.00015, "out": 0.0006 }
     }

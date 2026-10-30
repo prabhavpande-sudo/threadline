@@ -61,11 +61,6 @@ export async function whisperTranscribe(
     }));
 }
 
-/** The chat model. Chat always talks to OpenAI; the composer bar names it. */
-export function openaiModel(): string {
-  return process.env.SUMMARIZER_MODEL ?? "gpt-4o-mini";
-}
-
 /** Timestamped transcript in the `[Ns] speaker:` shape all prompts share. */
 export function flattenTranscript(utterances: Utterance[]): string {
   return utterances

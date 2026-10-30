@@ -170,7 +170,7 @@ async function main() {
 
   const live = LIVE && modelConfigured();
   if (LIVE && !live) {
-    console.error("--live needs a model: set PYAI_API_KEY (or OPENAI_API_KEY) in .env");
+    console.error("--live needs a model: set ANTHROPIC_API_KEY (or OPENAI_API_KEY) in .env");
     process.exit(2);
   }
   if (!live) {
