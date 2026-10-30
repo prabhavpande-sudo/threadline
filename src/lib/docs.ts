@@ -8,8 +8,7 @@
  */
 import { createRequire } from "node:module";
 import type { DatabaseSync } from "node:sqlite";
-import { hasOpenAI } from "./openai.js";
-import { chatJson } from "./model.js";
+import { chatJson, modelConfigured } from "./model.js";
 import { recordRun } from "./runlog.js";
 
 // pdf-parse is CommonJS; the /lib path skips its demo-mode entry point.
@@ -40,7 +39,7 @@ export async function extractDocText(ext: string, buf: Buffer): Promise<string |
 
 /** One-paragraph summary of a document, or null (no key / no text / model hiccup). */
 export async function summarizeDoc(db: DatabaseSync, title: string, text: string | null): Promise<string | null> {
-  if (!hasOpenAI() || !text?.trim()) return null;
+  if (!modelConfigured() || !text?.trim()) return null;
   try {
     // Closed loop like every other model workflow: recorded and metered.
     return await recordRun(

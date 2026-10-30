@@ -17,8 +17,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { Budget, retry, applyGate, normalize, decideExit, type StepRecord } from "../lib/harness.js";
 import { because, CodedError } from "../lib/reasons.js";
-import { chatJson, chatText } from "../lib/model.js";
-import { hasOpenAI } from "../lib/openai.js";
+import { chatJson, chatText, modelConfigured } from "../lib/model.js";
 import { retrieve, type Snippet } from "./retrieve.js";
 import { gates, type RawPoint } from "./ask.js";
 
@@ -72,7 +71,7 @@ function snippetsByIds(db: DatabaseSync, ids: number[]): Snippet[] {
 
 /** Condense the conversation + follow-up into a standalone retrieval query. */
 async function rewriteQuery(hist: { role: string; content: string }[], question: string, budget?: Budget): Promise<string> {
-  if (!hist.length || !hasOpenAI()) return question;
+  if (!hist.length || !modelConfigured()) return question;
   try {
     budget?.spendUnits(1);
     const content = await chatText({
@@ -216,7 +215,7 @@ export async function converse(db: DatabaseSync, conversationId: number, text: s
   const gate = gates(corpus); // grounding = fresh + everything this thread already saw
   const byId = new Map(corpus.map((s) => [s.chunk_id, s]));
 
-  if (!hasOpenAI() || process.env.THREADLINE_SYNTHESIS === "off") {
+  if (!modelConfigured() || process.env.THREADLINE_SYNTHESIS === "off") {
     const points = fresh.slice(0, 3).map((s) => ({ text: s.text, chunk_id: s.chunk_id, quote: s.text.slice(0, 80) }));
     const { kept } = applyGate(points, gate);
     return save("Closest passages from the meetings:", {

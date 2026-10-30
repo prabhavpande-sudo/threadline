@@ -15,7 +15,7 @@ import { processMeeting, reindexMeeting, type MeetingInput } from "../pipeline/e
 import { findOccurrences, applyCorrection, undoCorrection, detectWordSwap } from "../pipeline/corrections.js";
 import { chatAboutMeeting } from "../pipeline/notes.js";
 import { bulletAt, type StructuredSummary } from "../lib/summary.js";
-import { hasOpenAI, openaiModel } from "../lib/openai.js";
+import { hasOpenAI } from "../lib/openai.js";
 import { chatJson } from "../lib/model.js";
 import { extractDocText, summarizeDoc, EXTRACTABLE } from "../lib/docs.js";
 import type { Utterance } from "../lib/pyai.js";
@@ -40,7 +40,7 @@ import {
 } from "../lib/store.js";
 import { handoffCatalog, matchHandoff } from "../handoffs/registry.js";
 import { transcriptFingerprint } from "../lib/segments.js";
-import { modelInfo } from "../lib/model.js";
+import { modelConfigured, modelInfo } from "../lib/model.js";
 import { firstFailure, getRun, listRecentRuns, listRuns, recordRun, type RunRecord } from "../lib/runlog.js";
 import { log } from "../lib/log.js";
 import { publicReason, reasonFrom, type Outcome } from "../lib/reasons.js";
@@ -118,6 +118,7 @@ function setupStatus() {
   return {
     pyai: { configured: !!process.env.PYAI_API_KEY, masked: maskKey(process.env.PYAI_API_KEY) },
     openai: { configured: hasOpenAI(), masked: maskKey(process.env.OPENAI_API_KEY) },
+    anthropic: { configured: !!process.env.ANTHROPIC_API_KEY, masked: maskKey(process.env.ANTHROPIC_API_KEY) },
     model: modelInfo(),
     capture: { recorder_built: existsSync("capture/threadline-capture"), panel_built: existsSync("capture/threadline-panel") },
     google: { configured: googleConfigured(), connected: !!via, via },
@@ -341,7 +342,7 @@ const api: Record<string, Handler> = {
   },
 
   // Ask the brain: hybrid retrieval + gated synthesis. Costs an LLM call when
-  // OPENAI_API_KEY is set (extractive and fully local otherwise), so the UI
+  // a text model is configured (extractive and fully local otherwise), so the UI
   // fires it on Enter — never per keystroke.
   async "GET /api/ask"(p) {
     const q = (p.get("q") ?? "").trim();
@@ -761,7 +762,7 @@ const api: Record<string, Handler> = {
   async "POST /api/project/ask"(p, body) {
     const { project_id, question } = (body ?? {}) as { project_id?: number; question?: string };
     if (!project_id || !question?.trim()) return { error: "missing fields" };
-    if (!hasOpenAI()) return { error: "Set OPENAI_API_KEY in .env to enable project Q&A." };
+    if (!modelConfigured()) return { error: "Set ANTHROPIC_API_KEY in .env to enable project Q&A." };
     const project = db.prepare(`SELECT * FROM projects WHERE id = ?`).get(project_id) as
       | { name: string; description: string | null }
       | undefined;
@@ -1413,7 +1414,7 @@ const api: Record<string, Handler> = {
       // answering a different question.
       if (out.error) return { error: out.error };
     }
-    if (!hasOpenAI()) return { error: "OPENAI_API_KEY not configured — chat needs it" };
+    if (!modelConfigured()) return { error: "No text model configured — set ANTHROPIC_API_KEY in .env" };
     const utterances = meetingTranscript(meeting_id);
     if (!utterances.length) return { error: "no transcript yet" };
     // Closed loop like every other workflow: recorded, and a dead network is a
@@ -1543,9 +1544,9 @@ const api: Record<string, Handler> = {
       participants: m.participants,
       catalog: handoffCatalog(m.type),
       model: modelInfo(),
-      // Notes and handoffs go through the pluggable adapter; chat always talks
-      // to OpenAI, and the composer bar names the model doing the talking.
-      chat: { provider: "openai", model: openaiModel(), available: hasOpenAI() },
+      // Notes, handoffs and chat all go through the adapter; the composer bar
+      // names the model doing the talking.
+      chat: { provider: modelInfo().provider, model: modelInfo().model, available: modelConfigured() },
       handoffs: listHandoffRuns(db, id),
     };
   },

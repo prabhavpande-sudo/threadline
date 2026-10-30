@@ -13,10 +13,18 @@
  * makes the output trustworthy lives in lib/grounding.ts instead.
  */
 
+import Anthropic from "@anthropic-ai/sdk";
 import { chatModel, costOf } from "./config.js";
 import { log } from "./log.js";
 
-export type Provider = "pyai" | "openai" | "mock";
+export type Provider = "anthropic" | "pyai" | "openai" | "mock";
+
+/**
+ * Pinned in code, not agents.json: with an Anthropic key, every text call runs
+ * on Haiku — no env var, purpose override or config edit can upgrade it to a
+ * pricier model by accident.
+ */
+export const ANTHROPIC_MODEL = "claude-haiku-5-5";
 
 export type ModelCall = {
   /** What this call is for — shows up in logs and on the output card. */
@@ -60,7 +68,8 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.MODEL_TIMEOUT_MS ?? 240_000);
 const DEFAULT_TEMPERATURE = 0;
 
 /**
- * Provider resolution: explicit env wins, then the provider agents.json prefers
+ * Provider resolution: explicit env wins, then an Anthropic key (Haiku is the
+ * cheapest capable text model we have), then the provider agents.json prefers
  * (when its key is actually configured), else whichever key exists. Text chat
  * prefers OpenAI: PyAI hosts speech only (hear/speak/omni/amd — verified live
  * 2026-08-14, /v1/chat/completions 404s), so routing chat there just buys a
@@ -68,8 +77,9 @@ const DEFAULT_TEMPERATURE = 0;
  */
 export function provider(): Provider {
   const forced = (process.env.MODEL_PROVIDER ?? "").toLowerCase();
-  if (forced === "pyai" || forced === "openai" || forced === "mock") return forced;
+  if (forced === "anthropic" || forced === "pyai" || forced === "openai" || forced === "mock") return forced;
   if (mock) return "mock";
+  if (process.env.ANTHROPIC_API_KEY) return "anthropic";
   const preferred = chatModel().provider;
   if (preferred === "pyai" && process.env.PYAI_API_KEY) return "pyai";
   if (preferred === "openai" && process.env.OPENAI_API_KEY) return "openai";
@@ -83,6 +93,7 @@ export function provider(): Provider {
  */
 export function modelName(p: Provider = provider(), purpose?: string): string {
   if (p === "mock") return "mock";
+  if (p === "anthropic") return ANTHROPIC_MODEL;
   const env = p === "pyai" ? process.env.PYAI_CHAT_MODEL : process.env.SUMMARIZER_MODEL;
   if (env) return env;
   const cfg = chatModel();
@@ -94,6 +105,7 @@ export function modelName(p: Provider = provider(), purpose?: string): string {
 export function modelConfigured(): boolean {
   const p = provider();
   if (p === "mock") return true;
+  if (p === "anthropic") return !!process.env.ANTHROPIC_API_KEY;
   return p === "pyai" ? !!process.env.PYAI_API_KEY : !!process.env.OPENAI_API_KEY;
 }
 
@@ -185,8 +197,13 @@ export async function chatText(call: Omit<ModelCall, "format">): Promise<string>
   return typeof raw === "string" ? raw : JSON.stringify(raw);
 }
 
-/** The provider to fail over to: the other one, if its key is configured. */
+/**
+ * The provider to fail over to: the other one, if its key is configured.
+ * Anthropic never fails over — PyAI has no chat model, and quietly retrying on
+ * OpenAI would bill a model the user opted out of.
+ */
 function altProvider(p: Exclude<Provider, "mock">): Exclude<Provider, "mock"> | null {
+  if (p === "anthropic") return null;
   if (p === "pyai") return process.env.OPENAI_API_KEY ? "openai" : null;
   return process.env.PYAI_API_KEY ? "pyai" : null;
 }
@@ -224,12 +241,11 @@ function logUsage(usage: ModelUsage): void {
   });
 }
 
-/** The single outbound request. Both providers speak the OpenAI chat shape. */
-async function post(
-  p: Exclude<Provider, "mock">,
-  call: ModelCall,
-  temperature: number,
-): Promise<{ content: string; tokens: { tokensIn: number; tokensOut: number } }> {
+type PostResult = { content: string; tokens: { tokensIn: number; tokensOut: number } };
+
+/** The single outbound request. PyAI and OpenAI speak the OpenAI chat shape. */
+async function post(p: Exclude<Provider, "mock">, call: ModelCall, temperature: number): Promise<PostResult> {
+  if (p === "anthropic") return postAnthropic(call);
   const base =
     p === "pyai"
       ? process.env.PYAI_BASE_URL ?? "https://api.pyai.com/v1"
@@ -277,6 +293,43 @@ async function post(
     throw new ModelError(0, e instanceof Error ? e.message : String(e));
   } finally {
     clearTimeout(timer);
+  }
+}
+
+let anthropic: Anthropic | null = null;
+
+/**
+ * Anthropic Messages API. No temperature (Haiku 5.5 rejects non-default
+ * sampling) and no JSON mode, so JSON is asked for in the system prompt and
+ * parseJsonLoose recovers the rest. Thinking off + low effort: these are
+ * single-shot extraction/summary calls, and thinking tokens bill as output.
+ * SDK retries are off — lib/retry.ts owns retry policy.
+ */
+async function postAnthropic(call: ModelCall): Promise<PostResult> {
+  if (!process.env.ANTHROPIC_API_KEY) throw new ModelError(0, "ANTHROPIC_API_KEY is not set — cannot reach the model");
+  anthropic ??= new Anthropic({ maxRetries: 0, timeout: DEFAULT_TIMEOUT_MS });
+  const system =
+    call.format === "text" ? call.system : `${call.system}\n\nReply with a single JSON object and nothing else.`;
+  try {
+    const res = await anthropic.messages.create({
+      model: ANTHROPIC_MODEL,
+      max_tokens: call.maxTokens ?? 16_000,
+      thinking: { type: "disabled" },
+      output_config: { effort: "low" },
+      system,
+      messages: [...(call.history ?? []), { role: "user", content: call.user }],
+    });
+    if (res.stop_reason === "refusal") throw new ModelError(400, `anthropic declined "${call.purpose}"`);
+    const content = res.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
+    if (!content) throw new ModelError(200, "anthropic returned no message content");
+    return { content, tokens: { tokensIn: res.usage.input_tokens, tokensOut: res.usage.output_tokens } };
+  } catch (e) {
+    if (e instanceof ModelError) throw e;
+    if (e instanceof Anthropic.APIConnectionTimeoutError)
+      throw new ModelError(0, `model call "${call.purpose}" timed out after ${DEFAULT_TIMEOUT_MS}ms`);
+    if (e instanceof Anthropic.APIError)
+      throw new ModelError(e.status ?? 0, `anthropic chat failed: HTTP ${e.status ?? "-"} ${e.message.slice(0, 300)}`);
+    throw new ModelError(0, e instanceof Error ? e.message : String(e));
   }
 }
 
